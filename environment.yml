@@ -1,0 +1,25 @@
+name: ringss_restore_profile
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - astropy
+  - matplotlib
+  - numpy
+  - pandas
+  - pip
+  - pyzmq
+  - opencv
+  - scipy
+  - pip:
+      - PySide6>=6.4.0
+      - pywin32>=303; sys_platform == 'win32'
+      - zwoasi>=0.1.0
+      - ccdproc
+      - coveralls
+      - sphinx_rtd_theme
+      - sphinx
+      - tox
+      - flake8
+      - zernike

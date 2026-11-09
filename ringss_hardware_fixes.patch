@@ -1,0 +1,2512 @@
+diff --git a/.github/workflows/python-package.yml b/.github/workflows/python-package.yml
+index c6c5932..870436b 100644
+--- a/.github/workflows/python-package.yml
++++ b/.github/workflows/python-package.yml
+@@ -15,7 +15,7 @@ jobs:
+     runs-on: ubuntu-latest
+     strategy:
+       matrix:
+-        python-version: ['3.6', '3.7', '3.8', '3.9', '3.10']
++        python-version: ['3.8', '3.9', '3.10']
+ 
+     steps:
+     - uses: actions/checkout@v2
+diff --git a/environment.yml b/environment.yml
+index 7a33216..ae97264 100644
+--- a/environment.yml
++++ b/environment.yml
+@@ -1,12 +1,21 @@
+ name: ringss_restore_profile
++channels:
++  - conda-forge
++  - defaults
+ dependencies:
++  - python=3.10
+   - astropy
+   - matplotlib
+   - numpy
+   - pandas
+   - pip
++  - pyzmq
++  - opencv
+   - scipy
+   - pip:
++      - PySide6>=6.4.0
++      - pywin32>=303; sys_platform == 'win32'
++      - zwoasi>=0.1.0
+       - ccdproc
+       - coveralls
+       - sphinx_rtd_theme
+diff --git a/launch_suite.py b/launch_suite.py
+index 3198ac3..e1d501b 100644
+--- a/launch_suite.py
++++ b/launch_suite.py
+@@ -48,6 +48,57 @@ def ping_watchdog(port: int = 5559, timeout_ms: int = 600) -> bool:
+         sock.close()
+ 
+ 
++def watchdog_cluster_ready(port: int, expected_mock: bool, timeout_ms: int = 3000) -> bool:
++    ctx = zmq.Context.instance()
++    sock = ctx.socket(zmq.REQ)
++    sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
++    sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
++    sock.setsockopt(zmq.LINGER, 0)
++    try:
++        sock.connect(f"tcp://localhost:{port}")
++        sock.send_json({"action": "GET_STATUS"})
++        response = sock.recv_json()
++        if response.get("status") != "SUCCESS":
++            return False
++        cluster = response.get("cluster", {})
++        if cluster.get("mock_mode") is not expected_mock:
++            return False
++        services = cluster.get("services", {})
++        expected = {"mount", "focuser", "camera", "orchestrator"}
++        return expected.issubset(services) and all(
++            services[name].get("status") == "HEALTHY" for name in expected
++        )
++    except Exception:
++        return False
++    finally:
++        sock.close()
++
++
++def stop_watchdog_services(port: int, wd_thread: threading.Thread = None, owned: bool = False):
++    if not owned or wd_thread is None or not wd_thread.is_alive():
++        return
++    ctx = zmq.Context.instance()
++    sock = ctx.socket(zmq.REQ)
++    sock.setsockopt(zmq.RCVTIMEO, 50000)
++    sock.setsockopt(zmq.SNDTIMEO, 1000)
++    sock.setsockopt(zmq.LINGER, 0)
++    try:
++        sock.connect(f"tcp://localhost:{port}")
++        sock.send_json({"action": "STOP_ALL"})
++        response = sock.recv_json()
++        if response.get("status") != "SUCCESS":
++            logging.error("Watchdog did not confirm service shutdown: %s", response)
++    except Exception as e:
++        logging.error("Could not stop the service cluster cleanly: %s", e)
++    finally:
++        sock.close()
++
++    if wd_thread is not None and wd_thread.is_alive():
++        wd_thread.join(timeout=52.0)
++        if wd_thread.is_alive():
++            logging.error("Watchdog thread did not stop within the shutdown timeout.")
++
++
+ def main():
+     parser = argparse.ArgumentParser(description="RINGSS Master Observatory Suite Launcher")
+     parser.add_argument("--real", action="store_true", help="Operate with physical ASCOM/SDK hardware")
+@@ -59,37 +110,54 @@ def main():
+     logging.info(f"Starting RINGSS Observatory Suite [Initial Mode: {'MOCK' if mock_mode else 'PHYSICAL HARDWARE'}]...")
+ 
+     logging.info(f"Launching Watchdog Manager in background on port {args.port}...")
++    startup_event = threading.Event()
+     wd_thread = threading.Thread(
+         target=run_watchdog_server,
+-        kwargs={"port": args.port, "mock_mode": mock_mode},
++        kwargs={"port": args.port, "mock_mode": mock_mode, "startup_event": startup_event},
+         daemon=True
+     )
+     wd_thread.start()
+ 
+-    logging.info("Waiting for microservice cluster initialization and stabilization...")
++    logging.info("Waiting for watchdog and microservice health checks...")
+     t0 = time.time()
+     wd_ready = False
++    cluster_ready = False
+     while time.time() - t0 < 12.0:
+-        if ping_watchdog(port=args.port):
++        if startup_event.is_set() and wd_thread.is_alive() and ping_watchdog(port=args.port):
+             wd_ready = True
++            if watchdog_cluster_ready(args.port, mock_mode):
++                cluster_ready = True
++                break
++        if startup_event.is_set() and not wd_thread.is_alive():
+             break
+         time.sleep(0.4)
+ 
+-    if wd_ready:
+-        logging.info("[OK] Watchdog and microservices online and listening on assigned ports.")
++    if cluster_ready:
++        logging.info("[OK] Watchdog and all microservices are healthy in the requested mode.")
++    elif wd_ready:
++        logging.warning("[WARN] Watchdog is online, but one or more services failed health checks.")
+     else:
+-        logging.warning("[WARN] Watchdog initialization took longer than expected. Continuing launch...")
++        logging.error("Watchdog did not start or its requested port is already in use.")
++        stop_watchdog_services(args.port, wd_thread, owned=False)
++        return 1
+ 
+     if args.no_gui:
++        if not cluster_ready:
++            logging.error("Headless mode requires all services to pass pre-flight health checks.")
++            stop_watchdog_services(args.port, wd_thread, owned=wd_ready)
++            return 1
+         logging.info("Headless mode active (--no-gui). Press Ctrl+C to terminate services.")
+         try:
+             while True:
+                 time.sleep(1.0)
+         except KeyboardInterrupt:
+             logging.info("Stopping services...")
+-        return
++        finally:
++            stop_watchdog_services(args.port, wd_thread, owned=wd_ready)
++        return 0
+ 
+     logging.info("Launching RINGSS Mission Control GUI...")
++    return_code = 0
+     try:
+         from PySide6.QtWidgets import QApplication
+         from services.gui_app import RingssMainWindow
+@@ -105,33 +173,22 @@ def main():
+ 
+         window.show()
+         exit_code = app.exec()
++        return_code = exit_code
+         logging.info(f"GUI closed (exit code: {exit_code}).")
+ 
+     except ImportError:
+         logging.error("PySide6 is not available. Install it with: pip install PySide6")
++        return_code = 1
+     except Exception as e:
+         logging.exception(f"Error during GUI execution: {e}")
++        return_code = 1
+     finally:
+         logging.info("Sending orderly shutdown signal to cluster...")
+-        try:
+-            ctx = zmq.Context.instance()
+-            sock = ctx.socket(zmq.REQ)
+-            sock.setsockopt(zmq.RCVTIMEO, 2500)
+-            sock.setsockopt(zmq.SNDTIMEO, 2500)
+-            sock.setsockopt(zmq.LINGER, 0)
+-            sock.connect(f"tcp://localhost:{args.port}")
+-            sock.send_json({"action": "STOP_ALL"})
+-            sock.recv_json()
+-            sock.close()
+-        except Exception:
+-            pass
+-
+-        # Esperar a que el hilo del Watchdog termine antes de salir para evitar el error 0xC0000005
+-        if "wd_thread" in locals() and wd_thread.is_alive():
+-            wd_thread.join(timeout=3.0)
++        stop_watchdog_services(args.port, wd_thread, owned=wd_ready)
+ 
+         logging.info("RINGSS Suite shut down cleanly. Clear skies!")
++    return return_code
+ 
+ 
+ if __name__ == "__main__":
+-    main()
+\ No newline at end of file
++    raise SystemExit(main())
+\ No newline at end of file
+diff --git a/requirements.txt b/requirements.txt
+index 077b2b1..0e190d9 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -5,4 +5,7 @@ zwoasi>=0.1.0
+ pyzmq>=23.0.0
+ pytest>=7.0.0
+ scipy>=1.8.0
+-matplotlib>=3.5.0
+\ No newline at end of file
++matplotlib>=3.5.0
++pandas>=1.5.0
++PySide6>=6.4.0
++pywin32>=303; sys_platform == "win32"
+\ No newline at end of file
+diff --git a/current/services/abort_control.py b/services/abort_control.py
+new file mode 100644
+index 0000000..a16b1d6
+--- /dev/null
++++ b/services/abort_control.py
+@@ -0,0 +1,61 @@
++import logging
++import threading
++
++import zmq
++
++
++ORCHESTRATOR_CONTROL_PORT = 5560
++MOUNT_CONTROL_PORT = 5561
++FOCUSER_CONTROL_PORT = 5562
++CAMERA_CONTROL_PORT = 5563
++
++
++class AbortControlServer:
++    def __init__(self, port: int, handler, name: str):
++        self.port = port
++        self.handler = handler
++        self.name = name
++        self._stop_event = threading.Event()
++        self._ready_event = threading.Event()
++        self._thread = threading.Thread(target=self._serve, name=f"{name}-control", daemon=True)
++        self._error = None
++
++    def start(self):
++        self._thread.start()
++        if not self._ready_event.wait(3.0):
++            raise TimeoutError(f"{self.name} control endpoint did not start on port {self.port}.")
++        if self._error is not None:
++            raise RuntimeError(f"Could not start {self.name} control endpoint: {self._error}")
++
++    def close(self):
++        self._stop_event.set()
++        if self._thread.is_alive():
++            self._thread.join(timeout=2.0)
++
++    def _serve(self):
++        context = zmq.Context.instance()
++        sock = context.socket(zmq.REP)
++        sock.setsockopt(zmq.LINGER, 0)
++        try:
++            sock.bind(f"tcp://*:{self.port}")
++            self._ready_event.set()
++            while not self._stop_event.is_set():
++                if not sock.poll(100, zmq.POLLIN):
++                    continue
++                try:
++                    request = sock.recv_json()
++                    if not isinstance(request, dict):
++                        raise ValueError("Control request must be a JSON object.")
++                    if str(request.get("action", "")).upper() == "PING":
++                        response = {"status": "SUCCESS", "service": self.name}
++                    else:
++                        response = self.handler(request)
++                    sock.send_json(response)
++                except Exception as exc:
++                    logging.exception("Error in %s control endpoint", self.name)
++                    sock.send_json({"status": "ERROR", "message": str(exc)})
++        except Exception as exc:
++            self._error = exc
++            self._ready_event.set()
++        finally:
++            sock.close()
+\ No newline at end of file
+diff --git a/services/camera_tcp.py b/services/camera_tcp.py
+index 37b792a..f18ef71 100644
+--- a/services/camera_tcp.py
++++ b/services/camera_tcp.py
+@@ -5,12 +5,18 @@ import logging
+ import time
+ import re
+ import base64
++import threading
+ from pathlib import Path
+ from typing import Dict, Any, Optional
+ import zmq
+ import numpy as np
+ from astropy.io import fits
+ 
++try:
++    from .abort_control import AbortControlServer, CAMERA_CONTROL_PORT
++except ImportError:
++    from abort_control import AbortControlServer, CAMERA_CONTROL_PORT
++
+ try:
+     import zwoasi as asi
+     ZWO_SDK_AVAILABLE = True
+@@ -75,6 +81,7 @@ class CameraHardwareDriver:
+         self.camera_obj = None
+         self.last_frame_timestamp = 0.0
+         self.last_health_timestamp = time.time()
++        self.abort_requested = threading.Event()
+ 
+         if not self.mock_mode:
+             if ZWO_SDK_AVAILABLE:
+@@ -198,41 +205,64 @@ class CameraHardwareDriver:
+         }
+ 
+     def set_config(self, exposure_ms: float = None, gain: int = None, binning: int = None, roi: str = None) -> Dict[str, Any]:
++        previous = (self.exposure_ms, self.gain, self.binning, self.roi_width, self.roi_height)
++        new_exposure, new_gain, new_binning, new_width, new_height = previous
+         if exposure_ms is not None:
+             val_exp = float(exposure_ms)
+-            if val_exp <= 0:
++            if not np.isfinite(val_exp) or val_exp <= 0:
+                 raise ValueError(f"Exposición inválida: {val_exp} ms")
+-            self.exposure_ms = val_exp
++            new_exposure = val_exp
+         if gain is not None:
+-            self.gain = max(0, int(gain))
++            new_gain = int(gain)
++            if new_gain < 0:
++                raise ValueError("La ganancia no puede ser negativa.")
+         if binning is not None:
+-            self.binning = max(1, int(binning))
++            new_binning = int(binning)
++            if not 1 <= new_binning <= 4:
++                raise ValueError("El binning debe estar entre 1 y 4.")
+         if roi is not None:
+-            roi_str = str(roi)
+-            if "1920" in roi_str or "Full" in roi_str:
+-                self.roi_width, self.roi_height = 1920, 1080
++            roi_str = str(roi).lower()
++            if "1920" in roi_str or "full" in roi_str:
++                new_width, new_height = 1920, 1080
+             elif "256" in roi_str:
+-                self.roi_width, self.roi_height = 256, 256
++                new_width, new_height = 256, 256
+             elif "128" in roi_str:
+-                self.roi_width, self.roi_height = 128, 128
++                new_width, new_height = 128, 128
++            elif "64" in roi_str:
++                new_width, new_height = 64, 64
+             else:
+-                self.roi_width, self.roi_height = 64, 64
++                raise ValueError(f"ROI no reconocido: {roi}")
++
++        if new_width % new_binning or new_height % new_binning:
++            raise ValueError("El ROI debe ser divisible por el binning seleccionado.")
++
++        self.exposure_ms = new_exposure
++        self.gain = new_gain
++        self.binning = new_binning
++        self.roi_width = new_width
++        self.roi_height = new_height
+ 
+         if not self.mock_mode:
+-            if self.backend_type == "ZWO_SDK":
+-                self._apply_zwo_sdk_settings()
+-            elif self.backend_type == "ASCOM":
+-                try:
++            try:
++                if self.backend_type == "ZWO_SDK":
++                    self._apply_zwo_sdk_settings()
++                elif self.backend_type == "ASCOM":
+                     self.camera_obj.BinX = self.binning
+                     self.camera_obj.BinY = self.binning
+                     self.camera_obj.NumX = self.roi_width
+                     self.camera_obj.NumY = self.roi_height
+                     self.camera_obj.StartX = int((self.SENSOR_WIDTH - self.roi_width) // 2)
+                     self.camera_obj.StartY = int((self.SENSOR_HEIGHT - self.roi_height) // 2)
+-                    if hasattr(self.camera_obj, "Gain"):
+-                        self.camera_obj.Gain = int(self.gain)
+-                except Exception as e:
+-                    logging.warning(f"Aviso configurando ROI/Gain en ASCOM Camera: {e}")
++                    can_set_gain = bool(getattr(self.camera_obj, "CanSetGain", hasattr(self.camera_obj, "Gain")))
++                    if not can_set_gain or not hasattr(self.camera_obj, "Gain"):
++                        raise RuntimeError("El driver ASCOM no permite configurar la ganancia solicitada.")
++                    self.camera_obj.Gain = int(self.gain)
++                self.state = "IDLE"
++            except Exception as e:
++                self.exposure_ms, self.gain, self.binning, self.roi_width, self.roi_height = previous
++                self.state = "ERROR"
++                raise RuntimeError(f"No se pudo aplicar la configuración de cámara: {e}") from e
++            self.state = "IDLE"
+ 
+         logging.info(
+             f"Configuración de cámara aplicada -> Exp: {self.exposure_ms:.2f}ms, "
+@@ -275,6 +305,7 @@ class CameraHardwareDriver:
+                     self.camera_obj.start_video_capture()
+                     try:
+                         frame = self.camera_obj.capture_video_frame(timeout=timeout_ms)
++                        self._raise_if_aborted()
+                         arr = np.asarray(frame, dtype=np.float32)
+                         if arr.max() > 4095.0:
+                             arr = arr / 16.0
+@@ -286,6 +317,11 @@ class CameraHardwareDriver:
+                     self.camera_obj.StartExposure(exp_sec, True)
+                     t0 = time.time()
+                     while not bool(self.camera_obj.ImageReady):
++                        if self.abort_requested.is_set():
++                            try:
++                                self.camera_obj.AbortExposure()
++                            finally:
++                                raise InterruptedError("Preview ASCOM abortado por el operador.")
+                         if time.time() - t0 > (exp_sec + 8.0):
+                             raise TimeoutError("ASCOM ImageReady timeout during preview.")
+                         time.sleep(0.01)
+@@ -365,6 +401,7 @@ class CameraHardwareDriver:
+                 data_cube = np.zeros((n_frames, nx, nx), dtype=np.float32)
+ 
+                 for i in range(n_frames):
++                    self._raise_if_aborted()
+                     dx = 0.75 * dx + np.random.normal(0, 0.22)
+                     dy = 0.75 * dy + np.random.normal(0, 0.22)
+                     quad_a = 0.70 * quad_a + np.random.normal(0, 0.28)
+@@ -396,6 +433,7 @@ class CameraHardwareDriver:
+                     self.camera_obj.start_video_capture()
+                     try:
+                         for _ in range(n_frames):
++                            self._raise_if_aborted()
+                             frame = self.camera_obj.capture_video_frame(timeout=timeout_ms)
+                             arr = np.asarray(frame, dtype=np.float32)
+                             if arr.max() > 4095.0:
+@@ -408,12 +446,17 @@ class CameraHardwareDriver:
+ 
+                 elif self.backend_type == "ASCOM":
+                     exp_sec = max(0.0001, self.exposure_ms / 1000.0)
+-                    n_ascom = min(n_frames, 50)
+                     frames_list = []
+-                    for _ in range(n_ascom):
++                    for _ in range(n_frames):
++                        self._raise_if_aborted()
+                         self.camera_obj.StartExposure(exp_sec, True)
+                         t0 = time.time()
+                         while not bool(self.camera_obj.ImageReady):
++                            if self.abort_requested.is_set():
++                                try:
++                                    self.camera_obj.AbortExposure()
++                                finally:
++                                    raise InterruptedError("Captura ASCOM abortada por el operador.")
+                             if time.time() - t0 > (exp_sec + 10.0):
+                                 raise TimeoutError("Timeout esperando ImageReady en ASCOM Camera.")
+                             time.sleep(0.005)
+@@ -448,16 +491,24 @@ class CameraHardwareDriver:
+                 "timestamp": self.last_frame_timestamp
+             }
+ 
++        except InterruptedError as e:
++            self.state = "IDLE"
++            return {"status": "ABORTED", "message": str(e)}
+         except Exception as e:
+             self.state = "ERROR"
+             logging.error(f"Error durante captura de cámara: {e}")
+             raise RuntimeError(f"Fallo en captura FITS: {e}")
+ 
++    def _raise_if_aborted(self):
++        if self.abort_requested.is_set():
++            raise InterruptedError("Captura abortada por el operador.")
++
+ 
+ def run_camera_server(port: int = 5557, mock_mode: bool = True, camera_id: int = 0, ascom_prog_id: str = "ASCOM.ASICamera2.Camera"):
+     context = zmq.Context.instance()
+     socket = context.socket(zmq.REP)
+     driver = None
++    control_server = None
+     try:
+         try:
+             socket.bind(f"tcp://*:{port}")
+@@ -466,12 +517,20 @@ def run_camera_server(port: int = 5557, mock_mode: bool = True, camera_id: int =
+             return
+ 
+         driver = CameraHardwareDriver(mock_mode=mock_mode, camera_id=camera_id, ascom_prog_id=ascom_prog_id)
++        control_server = AbortControlServer(
++            CAMERA_CONTROL_PORT,
++            lambda message: _request_camera_abort(driver, message),
++            "Camera"
++        )
++        control_server.start()
+         logging.info(f"Servidor Camera_TCP escuchando en tcp://*:{port} [Mock Mode: {mock_mode}]...")
+ 
+         while True:
+             try:
+                 message = socket.recv_json()
+                 action = message.get("action", "").upper()
++                if action in ("CAPTURE", "GET_PREVIEW", "PREVIEW"):
++                    driver.abort_requested.clear()
+ 
+                 if action == "GET_STATUS":
+                     status = driver.get_status()
+@@ -513,11 +572,21 @@ def run_camera_server(port: int = 5557, mock_mode: bool = True, camera_id: int =
+     except KeyboardInterrupt:
+         logging.info("Apagando servidor Camera_TCP...")
+     finally:
++        if control_server is not None:
++            control_server.close()
+         if driver is not None:
+             driver.close()
+         socket.close()
+ 
+ 
++def _request_camera_abort(driver: CameraHardwareDriver, message: Dict[str, Any]) -> Dict[str, Any]:
++    action = str(message.get("action", "")).upper()
++    if action not in ("ABORT", "STOP"):
++        return {"status": "ERROR", "message": f"Acción de control desconocida: {action}"}
++    driver.abort_requested.set()
++    return {"status": "SUCCESS", "message": "Solicitud recibida; la captura se detendrá al terminar el frame actual."}
++
++
+ if __name__ == "__main__":
+     import argparse
+     parser = argparse.ArgumentParser(description="Camera TCP Microservice (ZWO ASI662MM)")
+diff --git a/services/focuser_tcp.py b/services/focuser_tcp.py
+index 1f69e62..c19a6d0 100644
+--- a/services/focuser_tcp.py
++++ b/services/focuser_tcp.py
+@@ -2,9 +2,15 @@ import sys
+ import json
+ import logging
+ import time
++import threading
+ from typing import Dict, Any, Optional
+ import zmq
+ 
++try:
++    from .abort_control import AbortControlServer, FOCUSER_CONTROL_PORT
++except ImportError:
++    from abort_control import AbortControlServer, FOCUSER_CONTROL_PORT
++
+ try:
+     import win32com.client
+     import pythoncom
+@@ -34,6 +40,8 @@ class FocuserHardwareDriver:
+         self.target_ring_offset = default_ring_offset
+         self.last_focused_position = 24420
+         self.is_moving = False
++        self.abort_requested = threading.Event()
++        self.max_position = 100000
+ 
+         if not self.mock_mode:
+             if not ASCOM_AVAILABLE:
+@@ -48,6 +56,7 @@ class FocuserHardwareDriver:
+                 if not bool(self.focuser.Connected):
+                     raise RuntimeError("El driver ASCOM del enfocador rechazó la conexión (Connected=False).")
+                 self.current_position = int(self.focuser.Position)
++                self.max_position = max(0, int(getattr(self.focuser, "MaxStep", self.max_position)))
+                 self.last_focused_position = self.current_position
+                 logging.info(f"¡Conexión ASCOM Focuser establecida! Posición actual: {self.current_position}")
+             except Exception as e:
+@@ -103,14 +112,18 @@ class FocuserHardwareDriver:
+ 
+     def move_abs(self, position: int) -> int:
+         target = int(position)
+-        if target < 0 or target > 100000:
+-            raise ValueError(f"Posición absoluta fuera de rango seguro [0, 100000]: {target}")
++        if target < 0 or target > self.max_position:
++            raise ValueError(f"Posición absoluta fuera de rango seguro [0, {self.max_position}]: {target}")
+ 
+         logging.info(f"Moviendo enfocador a posición ABSOLUTA: {target} [Mock: {self.mock_mode}]")
+ 
+         if self.mock_mode:
+             self.is_moving = True
+-            time.sleep(0.15)
++            for _ in range(3):
++                if self.abort_requested.is_set():
++                    self.is_moving = False
++                    raise InterruptedError("Movimiento del enfocador abortado por el operador.")
++                time.sleep(0.05)
+             self.current_position = target
+             self.is_moving = False
+         else:
+@@ -118,11 +131,21 @@ class FocuserHardwareDriver:
+                 self.focuser.Move(target)
+                 t0 = time.time()
+                 while bool(getattr(self.focuser, "IsMoving", False)):
++                    if self.abort_requested.is_set():
++                        self.halt()
++                        raise InterruptedError("Movimiento del enfocador abortado por el operador.")
+                     if time.time() - t0 > 30.0:
+                         raise TimeoutError("Tiempo de espera agotado moviendo enfocador EAF.")
+                     time.sleep(0.05)
+                 self.current_position = int(self.focuser.Position)
++                if abs(self.current_position - target) > 1:
++                    raise RuntimeError(
++                        f"El enfocador no confirmó la posición solicitada: {self.current_position} != {target}."
++                    )
++                self.is_moving = False
++            except InterruptedError:
+                 self.is_moving = False
++                raise
+             except Exception as e:
+                 self.is_moving = False
+                 logging.error(f"Error en Move Absoluto ASCOM: {e}")
+@@ -131,9 +154,13 @@ class FocuserHardwareDriver:
+         return self.current_position
+ 
+     def move_rel(self, steps: int) -> int:
++        if not self.mock_mode:
++            self.current_position = int(self.focuser.Position)
+         target_pos = self.current_position + int(steps)
+-        if target_pos < 0:
+-            raise ValueError(f"El movimiento relativo ({steps:+d}) causaría una posición negativa ({target_pos}).")
++        if target_pos < 0 or target_pos > self.max_position:
++            raise ValueError(
++                f"El movimiento relativo ({steps:+d}) quedaría fuera del rango [0, {self.max_position}]."
++            )
+         logging.info(f"Moviendo enfocador RELATIVO: {steps:+d} pasos [Mock: {self.mock_mode}]")
+         return self.move_abs(target_pos)
+ 
+@@ -201,6 +228,7 @@ def run_focuser_server(port: int = 5556, mock_mode: bool = True, ascom_prog_id:
+     context = zmq.Context.instance()
+     socket = context.socket(zmq.REP)
+     driver = None
++    control_server = None
+     try:
+         try:
+             socket.bind(f"tcp://*:{port}")
+@@ -209,12 +237,20 @@ def run_focuser_server(port: int = 5556, mock_mode: bool = True, ascom_prog_id:
+             return
+ 
+         driver = FocuserHardwareDriver(mock_mode=mock_mode, ascom_prog_id=ascom_prog_id, default_ring_offset=offset)
++        control_server = AbortControlServer(
++            FOCUSER_CONTROL_PORT,
++            lambda message: _request_focuser_abort(driver, message),
++            "Focuser"
++        )
++        control_server.start()
+         logging.info(f"Servidor Focuser_TCP escuchando en tcp://*:{port} [Mock Mode: {mock_mode}]...")
+ 
+         while True:
+             try:
+                 message = socket.recv_json()
+                 action = message.get("action", "").upper()
++                if action in ("MOVE_ABS", "MOVE_REL", "APPLY_RING_DEFOCUS", "RETURN_TO_FOCUS"):
++                    driver.abort_requested.clear()
+                 logging.info(f"Comando recibido: {action} | Payload: {message}")
+ 
+                 if action in ("GET_POS", "GET_STATUS"):
+@@ -263,11 +299,21 @@ def run_focuser_server(port: int = 5556, mock_mode: bool = True, ascom_prog_id:
+     except KeyboardInterrupt:
+         logging.info("Apagando servidor Focuser_TCP...")
+     finally:
++        if control_server is not None:
++            control_server.close()
+         if driver is not None:
+             driver.close()
+         socket.close()
+ 
+ 
++def _request_focuser_abort(driver: FocuserHardwareDriver, message: Dict[str, Any]) -> Dict[str, Any]:
++    action = str(message.get("action", "")).upper()
++    if action not in ("ABORT", "HALT", "STOP"):
++        return {"status": "ERROR", "message": f"Acción de control desconocida: {action}"}
++    driver.abort_requested.set()
++    return {"status": "SUCCESS", "message": "Solicitud recibida; la confirmación física está pendiente."}
++
++
+ if __name__ == "__main__":
+     import argparse
+     parser = argparse.ArgumentParser(description="Focuser TCP Microservice (ZWO EAF)")
+diff --git a/services/gui_app.py b/services/gui_app.py
+index 2a9dd76..58a7ce4 100644
+--- a/services/gui_app.py
++++ b/services/gui_app.py
+@@ -17,6 +17,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ if str(PROJECT_ROOT) not in sys.path:
+     sys.path.insert(0, str(PROJECT_ROOT))
+ 
++from services.abort_control import (
++    CAMERA_CONTROL_PORT,
++    FOCUSER_CONTROL_PORT,
++    MOUNT_CONTROL_PORT,
++    ORCHESTRATOR_CONTROL_PORT,
++)
++
+ def _locate_repo_dirs():
+     candidates = [
+         PROJECT_ROOT / "ringss_restore_profile",
+@@ -742,6 +749,13 @@ class RingssMainWindow(QMainWindow):
+         t_str = time.strftime("[%H:%M:%S]")
+         self.log_view.append(f"<span style='color: #64748b;'>{t_str}</span> {msg}")
+ 
++    def _camera_timeout_ms(self, frames: int) -> int:
++        try:
++            exposure_ms = max(0.001, float(self.edit_exp.text() or 1000) / 1000.0)
++        except ValueError:
++            exposure_ms = 1.0
++        return max(15000, int(frames * exposure_ms * 2.5 + 20000))
++
+     def on_roi_changed(self, idx):
+         roi_text = self.combo_roi.currentText()
+         self.log_message(f"[CAMERA] Field of View / ROI selected: {roi_text}")
+@@ -770,7 +784,7 @@ class RingssMainWindow(QMainWindow):
+         if not self.is_live_view or getattr(self, "_preview_busy", False):
+             return
+         self._preview_busy = True
+-        worker = ZeroMQClientWorker(5557, "GET_PREVIEW", timeout_ms=3000, parent=self)
++        worker = ZeroMQClientWorker(5557, "GET_PREVIEW", timeout_ms=self._camera_timeout_ms(1), parent=self)
+ 
+         def on_preview_received(act, r):
+             self._preview_busy = False
+@@ -996,7 +1010,7 @@ class RingssMainWindow(QMainWindow):
+     def action_nudge_mount(self, direction: str, arcsec: float = 10.0):
+         rate = self.combo_nudge_rate.currentText() if hasattr(self, "combo_nudge_rate") else "1X"
+         payload = {"direction": direction, "arcsec": float(arcsec), "rate": rate}
+-        worker = ZeroMQClientWorker(5555, "NUDGE", payload, timeout_ms=3000, parent=self)
++        worker = ZeroMQClientWorker(5555, "NUDGE", payload, timeout_ms=75000, parent=self)
+ 
+         def on_nudge_done(act, r):
+             if r.get("status") == "SUCCESS":
+@@ -1018,9 +1032,15 @@ class RingssMainWindow(QMainWindow):
+             self.log_message("[CAMERA] Live View paused for Auto-Centering routine.")
+ 
+         self.log_message("[AUTOCENTER] Acquiring reference sub-cube for closed-loop centering...")
+-        snap_file = str(PROJECT_ROOT / "data" / "captures" / "autocenter_probe.fits")
++        snap_file = str(PROJECT_ROOT / "data" / "captures" / f"autocenter_probe_{time.time_ns()}.fits")
+         os.makedirs(os.path.dirname(snap_file), exist_ok=True)
+-        worker = ZeroMQClientWorker(5557, "CAPTURE", {"filename": snap_file, "frames": 50}, parent=self)
++        worker = ZeroMQClientWorker(
++            5557,
++            "CAPTURE",
++            {"filename": snap_file, "frames": 50},
++            timeout_ms=self._camera_timeout_ms(50),
++            parent=self,
++        )
+ 
+         def on_probe_captured(act, r):
+             self.is_autocentering = False
+@@ -1028,24 +1048,38 @@ class RingssMainWindow(QMainWindow):
+                 self.log_message(f"[ERROR] Failed acquiring reference frame: {r.get('message')}")
+                 return
+ 
++            if not ASTROPY_AVAILABLE or not os.path.exists(r.get("filename", snap_file)):
++                self.log_message("[ERROR] Autocenter cannot validate a captured FITS frame.")
++                return
++
+             dx_px, dy_px = 0.0, 0.0
++            centroid_measured = False
+             fname = r.get("filename", snap_file)
+-            if os.path.exists(fname) and ASTROPY_AVAILABLE:
++            if os.path.exists(fname):
+                 try:
+                     with fits.open(fname) as hdul:
+                         data = hdul[0].data
+-                        if data is not None and data.size > 0:
+-                            frame = np.mean(data[:min(20, len(data))], axis=0) if data.ndim == 3 else data
+-                            ny, nx = frame.shape
+-                            y_idx, x_idx = np.indices((ny, nx))
+-                            bg = np.median(frame)
+-                            weights = np.clip(frame - bg, 0, None)
+-                            total_w = float(np.sum(weights)) or 1.0
+-                            dx_px = float(np.sum(weights * (x_idx - nx / 2.0)) / total_w)
+-                            dy_px = float(np.sum(weights * (y_idx - ny / 2.0)) / total_w)
+-                            self.refresh_detector_view(frame)
++                        if data is None or data.size == 0:
++                            raise ValueError("El FITS no contiene píxeles.")
++                        frame = np.mean(data[:min(20, len(data))], axis=0) if data.ndim == 3 else data
++                        ny, nx = frame.shape
++                        y_idx, x_idx = np.indices((ny, nx))
++                        bg = np.median(frame)
++                        weights = np.clip(frame - bg, 0, None)
++                        total_w = float(np.sum(weights))
++                        if not np.isfinite(total_w) or total_w <= 0:
++                            raise ValueError("No se detectó flujo positivo para calcular el centroide.")
++                        dx_px = float(np.sum(weights * (x_idx - nx / 2.0)) / total_w)
++                        dy_px = float(np.sum(weights * (y_idx - ny / 2.0)) / total_w)
++                        centroid_measured = np.isfinite(dx_px) and np.isfinite(dy_px)
++                        self.refresh_detector_view(frame)
+                 except Exception as ex:
+-                    self.log_message(f"[WARN] Error calculating centroid: {ex}")
++                    self.log_message(f"[ERROR] Error calculating centroid: {ex}")
++                    return
++
++            if not centroid_measured:
++                self.log_message("[ERROR] Autocenter did not produce a valid centroid measurement.")
++                return
+ 
+             err_r = math.hypot(dx_px, dy_px)
+             scale = getattr(self, "pixel_scale", 1.78)
+@@ -1094,7 +1128,7 @@ class RingssMainWindow(QMainWindow):
+ 
+     def send_mount_cmd(self, action: str):
+         self.log_message(f"[MOUNT] Dispatched command: {action}")
+-        worker = ZeroMQClientWorker(5555, action, timeout_ms=3000, parent=self)
++        worker = ZeroMQClientWorker(5555, action, timeout_ms=130000, parent=self)
+         def on_cmd_done(act, r):
+             self.log_message(f"[MOUNT] Response ({action}): {r.get('message', r.get('state', 'OK'))}")
+             if action in ("PARK", "HOME") and r.get("status") == "SUCCESS":
+@@ -1106,7 +1140,7 @@ class RingssMainWindow(QMainWindow):
+ 
+     def action_step_eaf(self, delta: int):
+         self.log_message(f"[EAF] Moving relative: {delta:+d} steps...")
+-        worker = ZeroMQClientWorker(5556, "MOVE_REL", {"steps": delta}, timeout_ms=4000, parent=self)
++        worker = ZeroMQClientWorker(5556, "MOVE_REL", {"steps": delta}, timeout_ms=35000, parent=self)
+         def on_eaf(act, r):
+             if r.get("status") == "SUCCESS":
+                 pos = r.get("position", "--")
+@@ -1135,14 +1169,14 @@ class RingssMainWindow(QMainWindow):
+         self.btn_autofocus.setText(f"Calibrating Ring (Iter {iteration}/{max_iters})...")
+         self.log_message(f"[AUTOFOCUS] Iteration {iteration}/{max_iters}: Acquiring probe frame...")
+ 
+-        probe_file = str(PROJECT_ROOT / "data" / "captures" / "autofocus_probe.fits")
++        probe_file = str(PROJECT_ROOT / "data" / "captures" / f"autofocus_probe_{time.time_ns()}.fits")
+         os.makedirs(os.path.dirname(probe_file), exist_ok=True)
+ 
+         worker_probe = ZeroMQClientWorker(
+             5557,
+             "CAPTURE",
+             {"filename": probe_file, "frames": 50, "star": self.combo_target.currentText()},
+-            timeout_ms=15000,
++            timeout_ms=self._camera_timeout_ms(50),
+             parent=self
+         )
+ 
+@@ -1154,7 +1188,7 @@ class RingssMainWindow(QMainWindow):
+                 self._finish_autofocus(False, f"Capture failed during autofocus: {p_res.get('message')}")
+                 return
+ 
+-            measured_rad = 10.5
++            measured_rad = None
+             fname = p_res.get("filename", probe_file)
+ 
+             if os.path.exists(fname) and ASTROPY_AVAILABLE and CUBE2_AVAILABLE:
+@@ -1167,13 +1201,17 @@ class RingssMainWindow(QMainWindow):
+                                 cube = cube[:, cy - 32:cy + 32, cx - 32:cx + 32]
+                             d_dict, imav = cube2.Moments(cube)
+                             impar = d_dict["image"]["impar"]
+-                            val = float(impar[3]) if isinstance(impar, list) else float(impar.get("meanrad", 10.5))
++                            val = float(impar[3]) if isinstance(impar, list) else float(impar["meanrad"])
+                             if np.isfinite(val) and val > 0.5:
+                                 measured_rad = val
+                             self.refresh_detector_view(imav)
+                 except Exception as err:
+                     self.log_message(f"[WARN] Error extracting ring radius: {err}")
+ 
++            if measured_rad is None:
++                self._finish_autofocus(False, "Could not measure a valid ring radius from the captured FITS cube.")
++                return
++
+             err_rad = 10.5 - measured_rad
+             self.log_message(
+                 f"[AUTOFOCUS] Iteration {iteration}/{max_iters}: Measured radius = {measured_rad:.2f} px "
+@@ -1200,7 +1238,13 @@ class RingssMainWindow(QMainWindow):
+             delta_steps = int(max(-100, min(100, round(err_rad * 43.0))))
+             self.log_message(f"[AUTOFOCUS] Adjusting EAF fine focus: {delta_steps:+d} steps...")
+ 
+-            worker_step = ZeroMQClientWorker(5556, "MOVE_REL", {"steps": delta_steps}, timeout_ms=4000, parent=self)
++            worker_step = ZeroMQClientWorker(
++                5556,
++                "MOVE_REL",
++                {"steps": delta_steps},
++                timeout_ms=35000,
++                parent=self,
++            )
+ 
+             def on_step_done(s_act, s_res):
+                 if not self.is_autofocusing:
+@@ -1235,7 +1279,7 @@ class RingssMainWindow(QMainWindow):
+         self.btn_autofocus.setStyleSheet("background-color: #d97706; color: white;")
+         self.log_message("[AUTOFOCUS] Applying base ring defocus offset...")
+ 
+-        worker_init = ZeroMQClientWorker(5556, "APPLY_RING_DEFOCUS", timeout_ms=4000, parent=self)
++        worker_init = ZeroMQClientWorker(5556, "APPLY_RING_DEFOCUS", timeout_ms=35000, parent=self)
+ 
+         def on_defocus_applied(act, r):
+             if not self.is_autofocusing:
+@@ -1262,11 +1306,15 @@ class RingssMainWindow(QMainWindow):
+             5557,
+             "SET_CONFIG",
+             {"exposure_ms": exp_us / 1000.0, "gain": gain, "roi": roi_text},
+-            timeout_ms=2500,
++            timeout_ms=5000,
+             parent=self
+         )
+         worker.response_received.connect(
+-            lambda a, r: self.log_message(f"[CAMERA] Parameters applied: ROI {r.get('roi_width', 64)}x{r.get('roi_height', 64)}.")
++            lambda a, r: self.log_message(
++                f"[CAMERA] Parameters applied: ROI {r.get('roi_width', 64)}x{r.get('roi_height', 64)}."
++                if r.get("status") == "SUCCESS"
++                else f"[ERROR] Camera settings rejected: {r.get('message', 'unknown error')}"
++            )
+         )
+         worker.start()
+ 
+@@ -1289,21 +1337,31 @@ class RingssMainWindow(QMainWindow):
+             "target_star": star
+         }
+ 
+-        worker = ZeroMQClientWorker(5558, "START_RINGSS_RUN", payload=payload, timeout_ms=35000, parent=self)
++        timeout_ms = max(35000, int(frames * (exp_us / 1000.0) * 2.5 + 20000))
++        worker = ZeroMQClientWorker(5558, "START_RINGSS_RUN", payload=payload, timeout_ms=timeout_ms, parent=self)
+ 
+         def on_orch_run_done(act, resp):
+             if resp.get("status") == "SUCCESS":
+-                seeing = float(resp.get("seeing_arcsec", 0.95))
+-                fsee = float(resp.get("free_seeing_arcsec", seeing * 0.65))
+-                fried = float(resp.get("fried_r0_cm", 10.5))
+-                zenith = float(resp.get("zenith_dist_deg", 14.2))
+-                wind = resp.get("wind_speed_ms", 11.0)
+-                tau0 = resp.get("tau0_ms", 4.5)
+-                theta0 = resp.get("theta0_arcsec", 2.1)
++                required = (
++                    "seeing_arcsec", "free_seeing_arcsec", "fried_r0_cm", "zenith_dist_deg",
++                    "wind_speed_ms", "tau0_ms", "theta0_arcsec", "ring_radius_px",
++                )
++                missing = [key for key in required if key not in resp]
++                if missing:
++                    self.log_message(f"[ERROR] Incomplete science result; missing: {', '.join(missing)}")
++                    return
++
++                seeing = float(resp["seeing_arcsec"])
++                fsee = float(resp["free_seeing_arcsec"])
++                fried = float(resp["fried_r0_cm"])
++                zenith = float(resp["zenith_dist_deg"])
++                wind = resp["wind_speed_ms"]
++                tau0 = resp["tau0_ms"]
++                theta0 = resp["theta0_arcsec"]
+                 heights = resp.get("heights_km")
+                 cn2 = resp.get("cn2_profile")
+                 fname = resp.get("filename")
+-                ring_rad = resp.get("ring_radius_px", 10.5)
++                ring_rad = resp["ring_radius_px"]
+ 
+                 self.lbl_seeing.setText(f"Seeing: <b>{seeing:.2f}</b> arcsec")
+                 self.lbl_fsee.setText(f"Free Atmosphere: <b>{fsee:.2f}</b> arcsec")
+@@ -1386,16 +1444,19 @@ class RingssMainWindow(QMainWindow):
+             self.toggle_live_view(force_off=True)
+ 
+         self.log_message("[CAMERA] Capturing FITS snapshot...")
+-        snap_file = str(PROJECT_ROOT / "data" / "captures" / "snapshot_frame.fits")
++        snap_file = str(PROJECT_ROOT / "data" / "captures" / f"snapshot_frame_{time.time_ns()}.fits")
+         os.makedirs(os.path.dirname(snap_file), exist_ok=True)
+         worker = ZeroMQClientWorker(
+             5557,
+             "CAPTURE",
+             {"filename": snap_file, "frames": 50, "star": self.combo_target.currentText()},
+-            timeout_ms=10000,
++            timeout_ms=self._camera_timeout_ms(50),
+             parent=self
+         )
+         def on_snap(act, r):
++            if r.get("status") != "SUCCESS":
++                self.log_message(f"[ERROR] Snapshot failed: {r.get('message', 'camera error')}")
++                return
+             fname = r.get("filename", snap_file)
+             self.log_message(f"[CAMERA] Frame saved: {fname}")
+             if os.path.exists(fname) and ASTROPY_AVAILABLE:
+@@ -1427,20 +1488,19 @@ class RingssMainWindow(QMainWindow):
+             self.btn_autofocus.setText("Run Ring Auto-Focus (EAF)")
+             self.btn_autofocus.setStyleSheet("background-color: #16a34a; color: white;")
+ 
+-        worker_abort = ZeroMQClientWorker(5558, "ABORT", timeout_ms=1200, parent=self)
+-        worker_abort.start()
+-
+-        worker_stop = ZeroMQClientWorker(5555, "STOP", timeout_ms=1200, parent=self)
+-        worker_stop.response_received.connect(
+-            lambda a, r: self.log_message(f"[MOUNT] Halted: {r.get('message', r.get('state'))}")
+-        )
+-        worker_stop.start()
+-
+-        worker_halt = ZeroMQClientWorker(5556, "HALT", timeout_ms=1200, parent=self)
+-        worker_halt.response_received.connect(
+-            lambda a, r: self.log_message(f"[EAF] Halted: {r.get('message', 'HALT')}")
+-        )
+-        worker_halt.start()
++        for port, label in [
++            (ORCHESTRATOR_CONTROL_PORT, "ORCHESTRATOR"),
++            (MOUNT_CONTROL_PORT, "MOUNT"),
++            (FOCUSER_CONTROL_PORT, "EAF"),
++            (CAMERA_CONTROL_PORT, "CAMERA"),
++        ]:
++            worker = ZeroMQClientWorker(port, "ABORT", timeout_ms=1500, parent=self)
++            worker.response_received.connect(
++                lambda action, response, device=label: self.log_message(
++                    f"[{device}] Abort signal: {response.get('message', response.get('status'))}"
++                )
++            )
++            worker.start()
+ 
+         self.btn_tracking_toggle.setText("Tracking: OFF")
+         self.btn_tracking_toggle.setStyleSheet("background-color: #1e293b; color: #f1f5f9;")
+diff --git a/services/mount_tcp.py b/services/mount_tcp.py
+index 34a78df..e929675 100644
+--- a/services/mount_tcp.py
++++ b/services/mount_tcp.py
+@@ -3,9 +3,15 @@ import json
+ import logging
+ import time
+ import math
++import threading
+ from typing import Dict, Any, Tuple, Optional
+ import zmq
+ 
++try:
++    from .abort_control import AbortControlServer, MOUNT_CONTROL_PORT
++except ImportError:
++    from abort_control import AbortControlServer, MOUNT_CONTROL_PORT
++
+ try:
+     import win32com.client
+     import pythoncom
+@@ -38,6 +44,7 @@ class MountHardwareDriver:
+         self.tracking_enabled = False
+         self.tracking_rate = "Sidereal"
+         self.nudge_rate = "1X"
++        self.abort_requested = threading.Event()
+ 
+         if not self.mock_mode:
+             if not ASCOM_AVAILABLE:
+@@ -145,7 +152,11 @@ class MountHardwareDriver:
+         logging.info(f"Iniciando GOTO hacia RA: {ra:.4f}h, DEC: {dec:.4f}° [Mock: {self.mock_mode}]")
+ 
+         if self.mock_mode:
+-            time.sleep(0.3)
++            for _ in range(6):
++                if self.abort_requested.is_set():
++                    self.state = "IDLE"
++                    raise InterruptedError("GOTO abortado por el operador.")
++                time.sleep(0.05)
+             self.current_ra = ra
+             self.current_dec = dec
+             self.tracking_enabled = True
+@@ -160,21 +171,30 @@ class MountHardwareDriver:
+ 
+                 if getattr(self.telescope, "CanSetTracking", False):
+                     self.telescope.Tracking = True
+-                    self.tracking_enabled = True
++                self.tracking_enabled = bool(getattr(self.telescope, "Tracking", False))
+ 
+                 if getattr(self.telescope, "CanSlewAsync", False):
+                     self.telescope.SlewToCoordinatesAsync(ra, dec)
+                     t0 = time.time()
+                     while getattr(self.telescope, "Slewing", False):
++                        if self.abort_requested.is_set():
++                            self.stop()
++                            raise InterruptedError("GOTO abortado por el operador.")
+                         if time.time() - t0 > 70.0:
+                             raise TimeoutError("Tiempo de espera agotado (70s) durante Slew asíncrono de la montura.")
+                         time.sleep(0.15)
+                 else:
+-                    self.telescope.SlewToCoordinates(ra, dec)
++                    raise RuntimeError(
++                        "El driver ASCOM no ofrece SlewToCoordinatesAsync; "
++                        "se rechaza GOTO síncrono porque bloquearía la parada de emergencia."
++                    )
+ 
+                 self.current_ra = float(self.telescope.RightAscension)
+                 self.current_dec = float(self.telescope.Declination)
+-                self.state = "TRACKING"
++                self.state = "TRACKING" if self.tracking_enabled else "IDLE"
++            except InterruptedError:
++                self.state = "IDLE"
++                raise
+             except Exception as e:
+                 self.state = "ERROR"
+                 logging.error(f"Error ejecutando GOTO en ASCOM: {e}")
+@@ -195,6 +215,8 @@ class MountHardwareDriver:
+ 
+         if rate is not None:
+             self.nudge_rate = str(rate)
++        if self.nudge_rate not in ("1X", "2X", "8X"):
++            raise ValueError(f"Tasa de nudge no soportada: {self.nudge_rate}")
+ 
+         mult = 1.0
+         if "2X" in self.nudge_rate:
+@@ -226,7 +248,11 @@ class MountHardwareDriver:
+         )
+ 
+         if self.mock_mode:
+-            time.sleep(0.1)
++            for _ in range(2):
++                if self.abort_requested.is_set():
++                    self.state = "IDLE"
++                    raise InterruptedError("Nudge abortado por el operador.")
++                time.sleep(0.05)
+             self.current_ra = target_ra
+             self.current_dec = target_dec
+             return self.current_ra, self.current_dec, effective_arcsec
+@@ -250,12 +276,17 @@ class MountHardwareDriver:
+                 self.telescope.PulseGuide(ascom_dirs[dir_up], duration_ms)
+                 t0 = time.time()
+                 while bool(getattr(self.telescope, "IsPulseGuiding", False)):
++                    if self.abort_requested.is_set():
++                        self.stop()
++                        raise InterruptedError("Nudge abortado por el operador.")
+                     if time.time() - t0 > (duration_ms / 1000.0 + 3.0):
+                         break
+                     time.sleep(0.02)
+                 self.current_ra = float(self.telescope.RightAscension)
+                 self.current_dec = float(self.telescope.Declination)
+                 return self.current_ra, self.current_dec, effective_arcsec
++            except InterruptedError:
++                raise
+             except Exception as pe:
+                 logging.warning(f"PulseGuide falló ({pe}). Recurriendo a micro-GOTO...")
+ 
+@@ -264,14 +295,22 @@ class MountHardwareDriver:
+ 
+     def set_tracking(self, enabled: bool, rate: str = "Sidereal") -> Dict[str, Any]:
+         """Activa/desactiva el seguimiento sideral continuo."""
+-        self.tracking_enabled = bool(enabled)
+-        self.tracking_rate = str(rate)
++        requested = bool(enabled)
++        if str(rate).strip().lower() != "sidereal":
++            raise ValueError(f"Tasa de seguimiento no soportada: {rate}")
++        self.tracking_rate = "Sidereal"
+         if not self.mock_mode:
+             try:
+                 if getattr(self.telescope, "CanSetTracking", False):
+-                    self.telescope.Tracking = self.tracking_enabled
++                    self.telescope.Tracking = requested
++                actual = bool(self.telescope.Tracking)
++                if actual != requested:
++                    raise RuntimeError("El driver no confirmó el estado de tracking solicitado.")
++                self.tracking_enabled = actual
+             except Exception as e:
+                 raise RuntimeError(f"Error configurando Tracking en ASCOM: {e}")
++        else:
++            self.tracking_enabled = requested
+ 
+         self.state = "TRACKING" if self.tracking_enabled else "IDLE"
+         logging.info(f"Tracking actualizado: {self.tracking_enabled} (Tasa: {self.tracking_rate})")
+@@ -282,7 +321,11 @@ class MountHardwareDriver:
+         logging.info("Enviando montura a posición Home...")
+         self.state = "SLEWING"
+         if self.mock_mode:
+-            time.sleep(0.4)
++            for _ in range(8):
++                if self.abort_requested.is_set():
++                    self.state = "IDLE"
++                    raise InterruptedError("HOME abortado por el operador.")
++                time.sleep(0.05)
+             self.current_ra = 0.0
+             self.current_dec = 0.0
+             self.tracking_enabled = False
+@@ -291,11 +334,26 @@ class MountHardwareDriver:
+             try:
+                 if getattr(self.telescope, "CanFindHome", False):
+                     self.telescope.FindHome()
++                    t0 = time.time()
++                    while bool(getattr(self.telescope, "Slewing", False)):
++                        if self.abort_requested.is_set():
++                            self.stop()
++                            raise InterruptedError("HOME abortado por el operador.")
++                        if time.time() - t0 > 120.0:
++                            raise TimeoutError("Tiempo de espera agotado buscando HOME.")
++                        time.sleep(0.1)
++                    if not bool(getattr(self.telescope, "AtHome", False)):
++                        raise RuntimeError("El driver terminó FindHome sin confirmar AtHome=True.")
+                 else:
+-                    self.goto(0.0, 0.0)
++                    raise RuntimeError(
++                        "El driver ASCOM no ofrece FindHome; no se ejecutará un GOTO arbitrario a (0, 0)."
++                    )
+                 self.current_ra = float(self.telescope.RightAscension)
+                 self.current_dec = float(self.telescope.Declination)
+                 self.state = "IDLE"
++            except InterruptedError:
++                self.state = "IDLE"
++                raise
+             except Exception as e:
+                 self.state = "ERROR"
+                 logging.error(f"Error al enviar a Home en ASCOM: {e}")
+@@ -305,6 +363,7 @@ class MountHardwareDriver:
+     def stop(self) -> str:
+         """Parada de emergencia verificada (AbortSlew + corte de Tracking)."""
+         logging.warning("Comando STOP de emergencia recibido. Abortando movimiento de montura...")
++        self.abort_requested.set()
+         if self.mock_mode:
+             self.tracking_enabled = False
+             self.state = "IDLE"
+@@ -315,6 +374,10 @@ class MountHardwareDriver:
+                     self.telescope.AbortSlew()
+                 if getattr(self.telescope, "CanSetTracking", False):
+                     self.telescope.Tracking = False
++                elif bool(getattr(self.telescope, "Tracking", False)):
++                    raise RuntimeError("El driver no permite desactivar tracking durante STOP.")
++                if bool(getattr(self.telescope, "Tracking", False)):
++                    raise RuntimeError("El driver sigue reportando Tracking=True tras STOP.")
+                 self.tracking_enabled = False
+ 
+                 t0 = time.time()
+@@ -336,23 +399,34 @@ class MountHardwareDriver:
+         self.state = "PARKING"
+         logging.info("Aparcando la montura...")
+         if self.mock_mode:
+-            time.sleep(0.4)
++            for _ in range(8):
++                if self.abort_requested.is_set():
++                    self.state = "IDLE"
++                    raise InterruptedError("PARK abortado por el operador.")
++                time.sleep(0.05)
+             self.current_ra = 0.0
+             self.current_dec = -90.0
+             self.tracking_enabled = False
+             self.state = "PARKED"
+         else:
+             try:
+-                if getattr(self.telescope, "CanPark", False):
+-                    self.telescope.Park()
+-                else:
+-                    if hasattr(self.telescope, "AbortSlew"):
+-                        self.telescope.AbortSlew()
+-                    if getattr(self.telescope, "CanSetTracking", False):
+-                        self.telescope.Tracking = False
++                if not getattr(self.telescope, "CanPark", False):
++                    raise RuntimeError("El driver ASCOM no ofrece CanPark; no se simulará un estacionamiento.")
++                self.telescope.Park()
++                t0 = time.time()
++                while not bool(getattr(self.telescope, "AtPark", False)):
++                    if self.abort_requested.is_set():
++                        self.stop()
++                        raise InterruptedError("PARK abortado por el operador.")
++                    if time.time() - t0 > 120.0:
++                        raise TimeoutError("Tiempo de espera agotado aparcando la montura.")
++                    time.sleep(0.1)
+                 self.tracking_enabled = False
+                 self.state = "PARKED"
+                 logging.info("Montura aparcada exitosamente.")
++            except InterruptedError:
++                self.state = "IDLE"
++                raise
+             except Exception as e:
+                 self.state = "ERROR"
+                 logging.error(f"Error al aparcar en ASCOM: {e}")
+@@ -364,6 +438,7 @@ def run_mount_server(port: int = 5555, mock_mode: bool = True, ascom_prog_id: st
+     context = zmq.Context.instance()
+     socket = context.socket(zmq.REP)
+     driver = None
++    control_server = None
+     try:
+         try:
+             socket.bind(f"tcp://*:{port}")
+@@ -372,12 +447,20 @@ def run_mount_server(port: int = 5555, mock_mode: bool = True, ascom_prog_id: st
+             return
+ 
+         driver = MountHardwareDriver(mock_mode=mock_mode, ascom_prog_id=ascom_prog_id)
++        control_server = AbortControlServer(
++            MOUNT_CONTROL_PORT,
++            lambda message: _request_mount_abort(driver, message),
++            "Mount"
++        )
++        control_server.start()
+         logging.info(f"Servidor Mount_TCP escuchando en tcp://*:{port} [Mock Mode: {mock_mode}]...")
+ 
+         while True:
+             try:
+                 message = socket.recv_json()
+                 action = message.get("action", "").upper()
++                if action in ("GOTO", "NUDGE", "HOME", "PARK"):
++                    driver.abort_requested.clear()
+ 
+                 if action == "GET_STATUS":
+                     status = driver.get_status()
+@@ -428,6 +511,10 @@ def run_mount_server(port: int = 5555, mock_mode: bool = True, ascom_prog_id: st
+                     state = driver.park()
+                     response = {"status": "SUCCESS", "message": "Montura aparcada", "state": state}
+ 
++                elif action == "SHUTDOWN":
++                    socket.send_json({"status": "SUCCESS", "message": "Mount server shutting down cleanly"})
++                    break
++
+                 else:
+                     response = {"status": "ERROR", "message": f"Acción desconocida: {action}"}
+ 
+@@ -443,11 +530,21 @@ def run_mount_server(port: int = 5555, mock_mode: bool = True, ascom_prog_id: st
+     except KeyboardInterrupt:
+         logging.info("Apagando servidor Mount_TCP...")
+     finally:
++        if control_server is not None:
++            control_server.close()
+         if driver is not None:
+             driver.close()
+         socket.close()
+ 
+ 
++def _request_mount_abort(driver: MountHardwareDriver, message: Dict[str, Any]) -> Dict[str, Any]:
++    action = str(message.get("action", "")).upper()
++    if action not in ("ABORT", "STOP"):
++        return {"status": "ERROR", "message": f"Acción de control desconocida: {action}"}
++    driver.abort_requested.set()
++    return {"status": "SUCCESS", "message": "Solicitud recibida; la confirmación física está pendiente."}
++
++
+ if __name__ == "__main__":
+     import argparse
+     parser = argparse.ArgumentParser(description="Mount TCP Microservice (ZWO AM5 / ASCOM)")
+diff --git a/services/pipeline_orchestrator.py b/services/pipeline_orchestrator.py
+index 95a3c09..1c769cb 100644
+--- a/services/pipeline_orchestrator.py
++++ b/services/pipeline_orchestrator.py
+@@ -3,6 +3,8 @@ import os
+ import time
+ import json
+ import logging
++import math
++import threading
+ from pathlib import Path
+ from typing import Dict, Any, Optional
+ import zmq
+@@ -13,6 +15,23 @@ if str(PROJECT_ROOT) not in sys.path:
+ 
+ from services.science_adapter import RingssSciencePipeline
+ 
++try:
++    from .abort_control import (
++        AbortControlServer,
++        CAMERA_CONTROL_PORT,
++        FOCUSER_CONTROL_PORT,
++        MOUNT_CONTROL_PORT,
++        ORCHESTRATOR_CONTROL_PORT,
++    )
++except ImportError:
++    from abort_control import (
++        AbortControlServer,
++        CAMERA_CONTROL_PORT,
++        FOCUSER_CONTROL_PORT,
++        MOUNT_CONTROL_PORT,
++        ORCHESTRATOR_CONTROL_PORT,
++    )
++
+ logging.basicConfig(
+     level=logging.INFO,
+     format="%(asctime)s [%(levelname)s] (Orchestrator): %(message)s",
+@@ -29,15 +48,24 @@ class PipelineOrchestrator:
+     Coordina de forma atómica el enfocador (5556), la cámara (5557), la montura (5555)
+     y el núcleo de reducción astrofísica (RingssSciencePipeline).
+     """
+-    def __init__(self, mount_port: int = 5555, focuser_port: int = 5556, camera_port: int = 5557):
++    def __init__(
++        self,
++        mount_port: int = 5555,
++        focuser_port: int = 5556,
++        camera_port: int = 5557,
++        mock_mode: bool = True,
++    ):
+         self.mount_port = mount_port
+         self.focuser_port = focuser_port
+         self.camera_port = camera_port
++        self.mock_mode = mock_mode
+ 
+         self.state = "IDLE"
+         self.abort_requested = False
++        self.abort_event = threading.Event()
++        self.state_lock = threading.Lock()
+         self.context = zmq.Context.instance()
+-        self.pipeline = RingssSciencePipeline()
++        self.pipeline = RingssSciencePipeline(allow_mock_fallback=mock_mode)
+ 
+     def _send_request(self, port: int, action: str, payload: Optional[Dict[str, Any]] = None, timeout_ms: int = 5000) -> Dict[str, Any]:
+         sock = self.context.socket(zmq.REQ)
+@@ -72,13 +100,37 @@ class PipelineOrchestrator:
+         ]:
+             try:
+                 res = self._send_request(port, act, timeout_ms=1500)
+-                if res.get("status") == "SUCCESS":
++                if (
++                    res.get("status") == "SUCCESS"
++                    and res.get("connected") is True
++                    and res.get("mock") is self.mock_mode
++                    and res.get("state") != "ERROR"
++                ):
+                     health[key] = True
+             except Exception as e:
+                 logging.warning(f"Microservicio en puerto {port} ({key}) no superó pre-flight: {e}")
+ 
+         return health
+ 
++    def _check_abort(self):
++        if self.abort_event.is_set():
++            raise InterruptedError("Operación abortada por el usuario.")
++
++    def _send_control_request(self, port: int, action: str, timeout_ms: int = 1000) -> Dict[str, Any]:
++        sock = self.context.socket(zmq.REQ)
++        sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
++        sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
++        sock.setsockopt(zmq.LINGER, 0)
++        try:
++            sock.connect(f"tcp://localhost:{port}")
++            sock.send_json({"action": action})
++            response = sock.recv_json()
++            if not isinstance(response, dict) or "status" not in response:
++                raise ValueError(f"Respuesta de control inválida en puerto {port}.")
++            return response
++        finally:
++            sock.close()
++
+     def execute_ringss_sequence(
+         self,
+         exp_ms: float = 1.0,
+@@ -86,14 +138,29 @@ class PipelineOrchestrator:
+         frames_cube: int = 100,
+         target_star: str = "HR 5944"
+     ) -> Dict[str, Any]:
+-        if self.state == "RUNNING":
+-            return {"status": "ERROR", "message": "Ya existe una secuencia científica en ejecución."}
+-
+-        self.state = "RUNNING"
+-        self.abort_requested = False
++        if not math.isfinite(exp_ms) or exp_ms <= 0:
++            return {"status": "ERROR", "message": "La exposición debe ser un valor finito mayor que cero."}
++        if not 50 <= int(frames_cube) <= 2000:
++            return {"status": "ERROR", "message": "El cubo debe solicitar entre 50 y 2000 frames."}
++        if int(gain) < 0:
++            return {"status": "ERROR", "message": "La ganancia no puede ser negativa."}
++        with self.state_lock:
++            if self.state in ("RUNNING", "ABORTING"):
++                return {"status": "ERROR", "message": "Ya existe una secuencia científica en ejecución."}
++            self.abort_requested = False
++            self.abort_event.clear()
++            self.state = "RUNNING"
+         initial_eaf_pos = None
+ 
+         try:
++            health = self.pre_flight_check()
++            unavailable = [name for name, healthy in health.items() if not healthy]
++            if unavailable:
++                raise RuntimeError(
++                    "Pre-flight fallido; no se iniciaron movimientos: " + ", ".join(unavailable)
++                )
++            self._check_abort()
++
+             logging.info(f">>> Iniciando secuencia científica RINGSS (Objetivo: {target_star}) <<<")
+ 
+             # Paso 1: Registrar posición de foco nítido base
+@@ -103,17 +170,16 @@ class PipelineOrchestrator:
+                 raise RuntimeError(f"Violación de contrato o fallo al leer posición del enfocador: {foc_res}")
+             initial_eaf_pos = foc_res["position"]
+ 
+-            if self.abort_requested:
+-                raise InterruptedError("Operación abortada por usuario.")
++            self._check_abort()
+ 
+             # Paso 2: Aplicar offset calibrado para formar el anillo de difracción
+             logging.info("[Paso 2/5] Aplicando offset de desenfoque RINGSS en EAF...")
+             defocus_res = self._send_request(self.focuser_port, "APPLY_RING_DEFOCUS")
++            self._check_abort()
+             if defocus_res.get("status") != "SUCCESS":
+                 raise RuntimeError(f"Fallo aplicando desenfoque: {defocus_res.get('message')}")
+ 
+-            if self.abort_requested:
+-                raise InterruptedError("Operación abortada por usuario.")
++            self._check_abort()
+ 
+             # Paso 3: Configurar cámara forzando explícitamente ROI 64x64 para el cubo científico
+             logging.info(f"[Paso 3/5] Configurando cámara ({exp_ms} ms, ganancia {gain}, ROI 64x64)...")
+@@ -123,14 +189,14 @@ class PipelineOrchestrator:
+                 {"exposure_ms": exp_ms, "gain": gain, "roi": "64x64"},
+                 timeout_ms=3000
+             )
++            self._check_abort()
+             if cfg_res.get("status") != "SUCCESS":
+                 raise RuntimeError(f"Fallo configurando cámara: {cfg_res.get('message')}")
+ 
+-            if self.abort_requested:
+-                raise InterruptedError("Operación abortada por usuario.")
++            self._check_abort()
+ 
+             # Paso 4: Adquirir cubo FITS pasando frames y estrella seleccionada
+-            fits_filename = str(CAPTURES_DIR / f"ring_cube_{int(time.time())}.fits")
++            fits_filename = str(CAPTURES_DIR / f"ring_cube_{time.time_ns()}.fits")
+             logging.info(f"[Paso 4/5] Adquiriendo cubo FITS ({fits_filename}, frames={frames_cube}, star={target_star})...")
+             cap_res = self._send_request(
+                 self.camera_port,
+@@ -140,22 +206,29 @@ class PipelineOrchestrator:
+                     "frames": int(frames_cube),
+                     "star": target_star
+                 },
+-                timeout_ms=30000
++                timeout_ms=max(30000, int(frames_cube * exp_ms * 2.5 + 20000))
+             )
++            self._check_abort()
+             if cap_res.get("status") != "SUCCESS":
+                 raise RuntimeError(f"Fallo en adquisición de cámara: {cap_res.get('message')}")
+ 
+             # Paso 5: Retornar enfocador inmediatamente al punto de foco óptimo
+             logging.info(f"[Paso 5/5] Retornando enfocador a foco óptimo ({initial_eaf_pos})...")
+-            self._send_request(self.focuser_port, "RETURN_TO_FOCUS", timeout_ms=4000)
++            focus_res = self._send_request(self.focuser_port, "RETURN_TO_FOCUS", timeout_ms=4000)
++            self._check_abort()
++            if focus_res.get("status") != "SUCCESS":
++                raise RuntimeError(f"Fallo al retornar el enfocador al foco: {focus_res.get('message')}")
++            self._check_abort()
+ 
+             # Reducción matemática con el núcleo científico de Tokovinin
+             logging.info("Ejecutando reducción astrofísica del cubo con ringss_restore_profile...")
+             science_results = self.pipeline.process_cube(fits_filename, star_hr=target_star)
++            self._check_abort()
++            if science_results.get("status") != "SUCCESS":
++                raise RuntimeError(f"Fallo de reducción científica: {science_results.get('message')}")
+ 
+-            self._cleanup_old_captures(keep_last=10)
+-
+-            self.state = "IDLE"
++            with self.state_lock:
++                self.state = "IDLE"
+             logging.info(
+                 f">>> Reducción finalizada: Seeing = {science_results['seeing_arcsec']} arcsec, "
+                 f"r0 = {science_results['fried_r0_cm']} cm, Viento = {science_results['wind_speed_ms']} m/s <<<"
+@@ -171,53 +244,57 @@ class PipelineOrchestrator:
+         except InterruptedError as ie:
+             logging.warning(f"Secuencia interrumpida: {ie}")
+             self._safety_rollback(initial_eaf_pos)
+-            self.state = "IDLE"
++            with self.state_lock:
++                self.state = "IDLE"
+             return {"status": "ABORTED", "message": str(ie)}
+ 
+         except Exception as e:
+             logging.exception("Fallo durante la secuencia científica.")
+             self._safety_rollback(initial_eaf_pos)
+-            self.state = "ERROR"
++            with self.state_lock:
++                self.state = "ERROR"
+             return {"status": "ERROR", "message": str(e)}
+ 
+-    def _cleanup_old_captures(self, keep_last: int = 10):
+-        try:
+-            files = sorted(CAPTURES_DIR.glob("ring_cube_*.fits"), key=lambda p: p.stat().st_mtime)
+-            if len(files) > keep_last:
+-                for old_f in files[:-keep_last]:
+-                    try:
+-                        old_f.unlink()
+-                    except Exception:
+-                        pass
+-        except Exception:
+-            pass
+-
+     def _safety_rollback(self, target_eaf_pos: Optional[int]):
+         logging.info("Ejecutando rollback de seguridad en hardware...")
+         if target_eaf_pos is not None:
+             try:
+-                self._send_request(self.focuser_port, "RETURN_TO_FOCUS", timeout_ms=3000)
++                response = self._send_request(
++                    self.focuser_port,
++                    "MOVE_ABS",
++                    {"position": int(target_eaf_pos)},
++                    timeout_ms=35000,
++                )
++                if response.get("status") != "SUCCESS" or int(response.get("position", -1)) != int(target_eaf_pos):
++                    logging.error("Rollback de enfocador no confirmado para %s: %s", target_eaf_pos, response)
+             except Exception as e:
+                 logging.error(f"Rollback de enfocador falló: {e}")
+ 
+     def abort_sequence(self):
+         logging.warning("¡Señal de ABORT recibida en Orchestrator! Deteniendo montura y enfocador...")
+-        self.abort_requested = True
+-        self.state = "ABORTING"
+-        try:
+-            self._send_request(self.mount_port, "STOP", timeout_ms=1000)
+-        except Exception:
+-            pass
+-        try:
+-            self._send_request(self.focuser_port, "HALT", timeout_ms=1000)
+-        except Exception:
+-            pass
+-        self.state = "IDLE"
++        with self.state_lock:
++            self.abort_requested = True
++            self.abort_event.set()
++            if self.state == "RUNNING":
++                self.state = "ABORTING"
++        requests = [
++            (MOUNT_CONTROL_PORT, "ABORT"),
++            (FOCUSER_CONTROL_PORT, "ABORT"),
++            (CAMERA_CONTROL_PORT, "ABORT"),
++        ]
++        responses = {}
++        for port, action in requests:
++            try:
++                responses[port] = self._send_control_request(port, action)
++            except Exception as e:
++                responses[port] = {"status": "ERROR", "message": str(e)}
++        return {"status": "SUCCESS", "state": self.state, "controls": responses}
+ 
+ 
+-def run_orchestrator_service(port: int = 5558):
++def run_orchestrator_service(port: int = 5558, mock_mode: bool = True):
+     context = zmq.Context.instance()
+     sock = context.socket(zmq.REP)
++    control_server = None
+     try:
+         try:
+             sock.bind(f"tcp://*:{port}")
+@@ -225,7 +302,13 @@ def run_orchestrator_service(port: int = 5558):
+             logging.info(f"Puerto {port} ya activo en esta sesión ({ze}).")
+             return
+ 
+-        orchestrator = PipelineOrchestrator()
++        orchestrator = PipelineOrchestrator(mock_mode=mock_mode)
++        control_server = AbortControlServer(
++            ORCHESTRATOR_CONTROL_PORT,
++            lambda message: _handle_orchestrator_control(orchestrator, message),
++            "Orchestrator"
++        )
++        control_server.start()
+         logging.info(f"Pipeline Orchestrator escuchando en tcp://*:{port}...")
+ 
+         while True:
+@@ -250,8 +333,7 @@ def run_orchestrator_service(port: int = 5558):
+                 sock.send_json(res)
+ 
+             elif action == "ABORT":
+-                orchestrator.abort_sequence()
+-                sock.send_json({"status": "SUCCESS", "message": "Abort signal dispatched to Mount and Focuser"})
++                sock.send_json(orchestrator.abort_sequence())
+ 
+             elif action == "GET_STATUS":
+                 sock.send_json({"status": "SUCCESS", "state": orchestrator.state})
+@@ -266,8 +348,22 @@ def run_orchestrator_service(port: int = 5558):
+     except KeyboardInterrupt:
+         logging.info("Apagando Pipeline Orchestrator...")
+     finally:
++        if control_server is not None:
++            control_server.close()
+         sock.close()
+ 
+ 
++def _handle_orchestrator_control(orchestrator: PipelineOrchestrator, message: Dict[str, Any]) -> Dict[str, Any]:
++    action = str(message.get("action", "")).upper()
++    if action not in ("ABORT", "STOP"):
++        return {"status": "ERROR", "message": f"Acción de control desconocida: {action}"}
++    return orchestrator.abort_sequence()
++
++
+ if __name__ == "__main__":
+-    run_orchestrator_service(port=5558)
+\ No newline at end of file
++    import argparse
++
++    parser = argparse.ArgumentParser(description="RINGSS Pipeline Orchestrator")
++    parser.add_argument("--real", action="store_true", help="Disable all synthetic science fallbacks")
++    args = parser.parse_args()
++    run_orchestrator_service(port=5558, mock_mode=not args.real)
+\ No newline at end of file
+diff --git a/services/science_adapter.py b/services/science_adapter.py
+index 02fe4e7..1dbe33b 100644
+--- a/services/science_adapter.py
++++ b/services/science_adapter.py
+@@ -69,7 +69,13 @@ class RingssSciencePipeline:
+     Integra cube2.py, getzen.py y profrest5.py con normalización de estructuras,
+     pre-acondicionamiento numérico NNLS y limpieza de identificadores HR.
+     """
+-    def __init__(self, par_file: Optional[Path] = None, telescope_override: Optional[Dict[str, float]] = None):
++    def __init__(
++        self,
++        par_file: Optional[Path] = None,
++        telescope_override: Optional[Dict[str, float]] = None,
++        allow_mock_fallback: bool = False,
++    ):
++        self.allow_mock_fallback = allow_mock_fallback
+         self.data_dir = DATA_DIR
+         self.par_file = par_file or (self.data_dir / "par-tololo.json")
+         self.params = self._load_json(self.par_file)
+@@ -124,21 +130,41 @@ class RingssSciencePipeline:
+         Ejecuta la reducción astrofísica completa de un cubo FITS 3D usando el pipeline de Tokovinin.
+         """
+         if not fits_path or not os.path.exists(fits_path):
+-            logging.warning(f"Archivo FITS '{fits_path}' no encontrado. Generando reducción sintética de respaldo...")
+-            return self._generate_mock_reduction(star_hr=star_hr)
++            return {"status": "ERROR", "message": f"Archivo FITS no encontrado: {fits_path}"}
+ 
+         try:
+             with fits.open(fits_path) as hdul:
+                 data_cube = hdul[0].data
+                 hdr = hdul[0].header
++        except Exception as e:
++            logging.exception("No se pudo leer el cubo FITS.")
++            return {"status": "ERROR", "message": f"FITS inválido o ilegible: {e}"}
+ 
+-            if data_cube is None or data_cube.ndim != 3 or data_cube.shape[0] < 50:
+-                logging.warning(
+-                    f"Cubo FITS '{fits_path}' con dimensiones insuficientes "
+-                    f"({getattr(data_cube, 'shape', None)}). Se requieren >= 50 frames."
+-                )
+-                return self._generate_mock_reduction(star_hr=star_hr)
++        if data_cube is None or data_cube.ndim != 3 or data_cube.shape[0] < 50:
++            return {
++                "status": "ERROR",
++                "message": (
++                    f"Cubo FITS inválido ({getattr(data_cube, 'shape', None)}); "
++                    "se requieren al menos 50 frames en un cubo 3D."
++                ),
++            }
+ 
++        try:
++            exposure_us = float(hdr["EXPOSURE"])
++            gain_value = float(hdr["GAIN"])
++            date_obs = str(hdr["DATE-OBS"]).strip()
++            if (
++                not np.isfinite(exposure_us)
++                or exposure_us <= 0
++                or not np.isfinite(gain_value)
++                or gain_value < 0
++                or not date_obs
++            ):
++                raise ValueError("Metadatos de exposición, ganancia o fecha no físicos.")
++        except (KeyError, TypeError, ValueError) as e:
++            return {"status": "ERROR", "message": f"Metadatos FITS incompletos o inválidos: {e}"}
++
++        try:
+             # Si el cubo viene en un ROI mayor (ej. 128x128 o 256x256), recortar sub-ventana central 64x64
+             nz, ny, nx = data_cube.shape
+             if nx > 64 or ny > 64:
+@@ -171,42 +197,46 @@ class RingssSciencePipeline:
+             # 2. Identificación de la estrella en catálogo y cálculo de distancia cenital real
+             clean_hr = self.clean_star_hr(star_hr or hdr.get("STAR", "5944"))
+             star_coords = getzen.get_star(clean_hr, self.starcat)
++            if not isinstance(star_coords, list) or len(star_coords) != 4 or star_coords[0] <= 0:
++                if not self.allow_mock_fallback:
++                    raise ValueError(f"La estrella HR {clean_hr} no está disponible en el catálogo científico.")
++                star_coords = None
+ 
+             cubepar = {
+                 "nx": int(nx),
+                 "nz": int(nz),
+-                "texp": float(hdr.get("EXPOSURE", 2000)) * 1e-6,
+-                "gain": float(hdr.get("GAIN", 100.0)),
+-                "date": str(hdr.get("DATE-OBS", "2026-11-08T02:00:00")),
++                "texp": exposure_us * 1e-6,
++                "gain": gain_value,
++                "date": date_obs,
+                 "star": clean_hr
+             }
+             data_dict["cubepar"] = cubepar
+ 
+-            if isinstance(star_coords, list) and len(star_coords) == 4 and star_coords[0] > 0:
++            if star_coords is None:
++                starpar = None
++            else:
+                 try:
+                     starpar = getzen.get_starpar(self.params, data_dict, star_coords, clean_hr)
+-                    # Garantizar que zen esté en rango útil [0, 75°] si la prueba se realiza fuera de horario nocturno
+-                    if not (0.0 <= starpar.get("zen", 90.0) <= 75.0):
+-                        starpar["zen"] = 14.2
+-                    data_dict["starpar"] = starpar
+                 except Exception:
+-                    data_dict["starpar"] = {
+-                        "JD": 2460000.5,
+-                        "HR": int(clean_hr) if clean_hr.isdigit() else 5944,
+-                        "Vmag": float(star_coords[2]),
+-                        "BV": float(star_coords[3]),
+-                        "zen": 14.2,
+-                        "az": 180.0
+-                    }
+-            else:
+-                data_dict["starpar"] = {
++                    if not self.allow_mock_fallback:
++                        raise
++                    starpar = None
++
++            if starpar is None:
++                starpar = {
+                     "JD": 2460000.5,
+                     "HR": int(clean_hr) if clean_hr.isdigit() else 5944,
+-                    "Vmag": 2.89,
+-                    "BV": -0.19,
++                    "Vmag": float(star_coords[2]) if star_coords else 2.89,
++                    "BV": float(star_coords[3]) if star_coords else -0.19,
+                     "zen": 14.2,
+-                    "az": 180.0
++                    "az": 180.0,
+                 }
++            zenith = float(starpar.get("zen", float("nan")))
++            if not np.isfinite(zenith) or not 0.0 <= zenith <= 75.0:
++                if not self.allow_mock_fallback:
++                    raise ValueError(f"Distancia cenital fuera del rango científico válido: {zenith}")
++                starpar["zen"] = 14.2
++            data_dict["starpar"] = starpar
+ 
+             # 3. Restauración del perfil vertical de turbulencia Cn2(h) mediante NNLS (profrest5.restore)
+             logging.info(f"Restaurando perfil Cn2(h) e integrales de Seeing para HR {clean_hr}...")
+@@ -219,29 +249,21 @@ class RingssSciencePipeline:
+             if not np.isfinite(see_val) or see_val <= 0.01:
+                 raise ValueError(f"Seeing restaurado fuera de rango físico: {see_val}")
+ 
+-            see2_val = float(profile.get("see2", see_val))
+-            if not np.isfinite(see2_val) or see2_val <= 0.0:
+-                see2_val = see_val
+-
+-            fsee_val = float(profile.get("fsee", see_val * 0.7))
+-            wind_val = float(profile.get("wind", 10.5))
+-            if not np.isfinite(wind_val) or wind_val <= 0.0:
+-                wind_val = 10.5
+-
+-            tau0_val = float(profile.get("tau0", 3.8))
+-            if not np.isfinite(tau0_val) or tau0_val <= 0.0:
+-                tau0_val = 3.8
+-
+-            theta0_val = float(profile.get("theta0", 1.95))
+-            if not np.isfinite(theta0_val) or theta0_val <= 0.0:
+-                theta0_val = 1.95
++            see2_val = float(profile["see2"])
++            fsee_val = float(profile["fsee"])
++            wind_val = float(profile["wind"])
++            tau0_val = float(profile["tau0"])
++            theta0_val = float(profile["theta0"])
++            required_metrics = (see2_val, fsee_val, wind_val, tau0_val, theta0_val)
++            if not all(np.isfinite(value) and value > 0.0 for value in required_metrics):
++                raise ValueError("El núcleo devolvió métricas científicas incompletas o no físicas.")
+ 
+             r0_cm = round((0.101 / max(see_val, 0.05)) * 100.0, 1)
+             impar_dict = data_dict["image"]["impar"]
+ 
+             return {
+                 "status": "SUCCESS",
+-                "mode": "SCIENCE_CORE",
++                "mode": "MOCK_SCIENCE_CORE" if self.allow_mock_fallback else "SCIENCE_CORE",
+                 "star_hr": f"HR {clean_hr}",
+                 "seeing_arcsec": round(see_val, 2),
+                 "free_seeing_arcsec": round(fsee_val, 2),
+@@ -262,8 +284,10 @@ class RingssSciencePipeline:
+             }
+ 
+         except Exception as e:
+-            logging.error(f"Error procesando cubo en ScienceCore ({e}). Activando modelo sintético de respaldo...")
+-            return self._generate_mock_reduction(star_hr=star_hr)
++            logging.exception("Error procesando cubo en ScienceCore.")
++            if self.allow_mock_fallback:
++                return self._generate_mock_reduction(star_hr=star_hr)
++            return {"status": "ERROR", "message": f"Falló la reducción científica: {e}"}
+ 
+     def _generate_mock_reduction(self, star_hr: str = "HR 5944") -> Dict[str, Any]:
+         """Respaldo sintético coherente en caso de ausencia de archivo FITS."""
+diff --git a/services/watchdog_manager.py b/services/watchdog_manager.py
+index bf4547d..01ec339 100644
+--- a/services/watchdog_manager.py
++++ b/services/watchdog_manager.py
+@@ -4,10 +4,26 @@ import time
+ import json
+ import logging
+ import subprocess
++import threading
+ from pathlib import Path
+ from typing import Dict, Any, Optional
+ import zmq
+ 
++try:
++    from .abort_control import (
++        CAMERA_CONTROL_PORT,
++        FOCUSER_CONTROL_PORT,
++        MOUNT_CONTROL_PORT,
++        ORCHESTRATOR_CONTROL_PORT,
++    )
++except ImportError:
++    from abort_control import (
++        CAMERA_CONTROL_PORT,
++        FOCUSER_CONTROL_PORT,
++        MOUNT_CONTROL_PORT,
++        ORCHESTRATOR_CONTROL_PORT,
++    )
++
+ PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ PYTHON_EXE = sys.executable
+ 
+@@ -21,24 +37,28 @@ SERVICES_SPEC = {
+     "mount": {
+         "script": "services/mount_tcp.py",
+         "port": 5555,
++        "control_port": MOUNT_CONTROL_PORT,
+         "ping_action": "GET_STATUS",
+         "is_hardware": True
+     },
+     "focuser": {
+         "script": "services/focuser_tcp.py",
+         "port": 5556,
++        "control_port": FOCUSER_CONTROL_PORT,
+         "ping_action": "GET_POS",
+         "is_hardware": True
+     },
+     "camera": {
+         "script": "services/camera_tcp.py",
+         "port": 5557,
++        "control_port": CAMERA_CONTROL_PORT,
+         "ping_action": "GET_STATUS",
+         "is_hardware": True
+     },
+     "orchestrator": {
+         "script": "services/pipeline_orchestrator.py",
+         "port": 5558,
++        "control_port": ORCHESTRATOR_CONTROL_PORT,
+         "ping_action": "GET_STATUS",
+         "is_hardware": False
+     }
+@@ -86,6 +106,8 @@ class WatchdogManager:
+             progid = self.progids.get(name)
+             if progid:
+                 cmd.extend(["--progid", progid])
++        elif not self.mock_mode and name == "orchestrator":
++            cmd.append("--real")
+ 
+         for attempt in range(1, 4):
+             try:
+@@ -93,8 +115,6 @@ class WatchdogManager:
+                 p = subprocess.Popen(
+                     cmd,
+                     cwd=str(PROJECT_ROOT),
+-                    stdout=subprocess.DEVNULL,
+-                    stderr=subprocess.DEVNULL
+                 )
+                 self.processes[name] = p
+                 self.service_status[name] = "STARTING"
+@@ -146,7 +166,10 @@ class WatchdogManager:
+                 if not self.mock_mode and spec["is_hardware"]:
+                     if resp.get("mock") is True:
+                         return False
+-                return True
++                control_resp = self._send_service_request(
++                    spec["control_port"], "PING", timeout_ms=timeout_ms
++                )
++                return control_resp.get("status") == "SUCCESS"
+             return False
+         except Exception:
+             return False
+@@ -208,37 +231,57 @@ class WatchdogManager:
+                         self.start_service(name)
+ 
+     def _terminate_process(self, name: str):
+-        proc = self.processes.pop(name, None)
++        proc = self.processes.get(name)
+         if proc is not None and proc.poll() is None:
+             spec = SERVICES_SPEC.get(name)
+             if spec:
+                 try:
+-                    sock = self.context.socket(zmq.REQ)
+-                    sock.setsockopt(zmq.RCVTIMEO, 1200)
+-                    sock.setsockopt(zmq.SNDTIMEO, 800)
+-                    sock.setsockopt(zmq.LINGER, 0)
+-                    sock.connect(f"tcp://localhost:{spec['port']}")
+-                    sock.send_json({"action": "SHUTDOWN"})
+-                    sock.recv_json()
+-                    sock.close()
++                    self._send_service_request(spec["control_port"], "ABORT", timeout_ms=1000)
++                except Exception:
++                    pass
++                try:
++                    self._send_service_request(spec["port"], "SHUTDOWN", timeout_ms=1500)
+                 except Exception:
+                     pass
+ 
+             try:
+-                proc.wait(timeout=1.5)
++                proc.wait(timeout=12.0)
+             except Exception:
++                if not self.mock_mode and spec and spec["is_hardware"]:
++                    logging.critical(
++                        "Hardware service '%s' did not confirm shutdown; preserving PID %s instead of force-killing it.",
++                        name,
++                        proc.pid,
++                    )
++                    self.service_status[name] = "UNRESPONSIVE_PRESERVED"
++                    return
+                 try:
+                     proc.terminate()
+-                    proc.wait(timeout=1.0)
++                    proc.wait(timeout=2.0)
+                 except Exception:
+                     try:
+                         proc.kill()
++                        proc.wait(timeout=2.0)
+                     except Exception:
+                         pass
+ 
++        self.processes.pop(name, None)
+         self.service_status[name] = "STOPPED"
+         self.consecutive_failures[name] = 0
+ 
++    def _send_service_request(self, port: int, action: str, timeout_ms: int) -> Dict[str, Any]:
++        sock = self.context.socket(zmq.REQ)
++        sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
++        sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
++        sock.setsockopt(zmq.LINGER, 0)
++        try:
++            sock.connect(f"tcp://localhost:{port}")
++            sock.send_json({"action": action})
++            response = sock.recv_json()
++            return response if isinstance(response, dict) else {"status": "ERROR"}
++        finally:
++            sock.close()
++
+     def stop_all_services(self):
+         logging.info("Stopping all RINGSS microservices cleanly...")
+         for name in ["orchestrator", "camera", "focuser", "mount"]:
+@@ -265,13 +308,26 @@ class WatchdogManager:
+         }
+ 
+ 
+-def run_watchdog_server(port: int = 5559, mock_mode: bool = True):
++def run_watchdog_server(
++    port: int = 5559,
++    mock_mode: bool = True,
++    startup_event: Optional[threading.Event] = None,
++):
+     manager = WatchdogManager(mock_mode=mock_mode)
+-    manager.start_all_services()
+-
+     context = zmq.Context.instance()
+     sock = context.socket(zmq.REP)
+-    sock.bind(f"tcp://*:{port}")
++    try:
++        sock.bind(f"tcp://*:{port}")
++    except zmq.error.ZMQError as ze:
++        logging.critical("Watchdog could not bind port %s; no child services were started: %s", port, ze)
++        sock.close()
++        if startup_event is not None:
++            startup_event.set()
++        return
++
++    if startup_event is not None:
++        startup_event.set()
++    manager.start_all_services()
+ 
+     logging.info(f"Watchdog Manager listening on tcp://*:{port}...")
+ 
+diff --git a/setup.cfg b/setup.cfg
+index af13a81..ae8edce 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -27,15 +27,20 @@ edit_on_github = False
+ [options]
+ zip_safe = False
+ packages = find:
+-python_requires = >=3.7
++python_requires = >=3.8
+ setup_requires = setuptools_scm
+ install_requires =
+-    astropy
+-    matplotlib
+-    numpy
++    astropy>=5.0
++    matplotlib>=3.5
++    numpy>=1.22
+     pandas
+-    scipy
++    scipy>=1.8
+     ccdproc
++    opencv-python>=4.5
++    pyzmq>=23
++    PySide6>=6.4
++    pywin32>=303; sys_platform == "win32"
++    zwoasi>=0.1.0
+ 
+ [options.extras_require]
+ test =
+diff --git a/start_ringss.bat b/start_ringss.bat
+index 48c8eb3..2337da8 100644
+--- a/start_ringss.bat
++++ b/start_ringss.bat
+@@ -8,10 +8,8 @@ echo   RINGSS OBSERVATORY SUITE - INICIALIZANDO
+ echo =======================================================
+ echo.
+ 
+-:: 1. Limpiar procesos residuales de Python que puedan bloquear puertos o archivos
+-echo [1/3] Verificando y limpiando procesos residuales de Python...
+-taskkill /F /IM python.exe >nul 2>&1
+-timeout /t 1 /nobreak >nul
++:: 1. Verificar el entorno sin cerrar procesos Python ajenos
++echo [1/3] Verificando el entorno sin cerrar otros procesos Python...
+ 
+ :: 2. Identificar el interprete del entorno virtual
+ set "VENV_PYTHON="
+diff --git a/current/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+index 0000000..a05d49e
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,22 @@
++import zmq
++import pytest
++
++
++@pytest.fixture(scope="module")
++def shutdown_service():
++    def shutdown(port):
++        context = zmq.Context()
++        socket = context.socket(zmq.REQ)
++        socket.setsockopt(zmq.RCVTIMEO, 2000)
++        socket.setsockopt(zmq.SNDTIMEO, 1000)
++        socket.setsockopt(zmq.LINGER, 0)
++        try:
++            socket.connect(f"tcp://localhost:{port}")
++            socket.send_json({"action": "SHUTDOWN"})
++            response = socket.recv_json()
++            assert response.get("status") == "SUCCESS", response
++        finally:
++            socket.close()
++            context.term()
++
++    return shutdown
+\ No newline at end of file
+diff --git a/current/tests/test_abort_control.py b/tests/test_abort_control.py
+new file mode 100644
+index 0000000..b533fd7
+--- /dev/null
++++ b/tests/test_abort_control.py
+@@ -0,0 +1,35 @@
++import socket
++import threading
++
++import zmq
++
++from services.abort_control import AbortControlServer
++
++
++def test_abort_control_endpoint_delivers_signal():
++    with socket.socket() as reservation:
++        reservation.bind(("127.0.0.1", 0))
++        port = reservation.getsockname()[1]
++
++    abort_event = threading.Event()
++    server = AbortControlServer(
++        port,
++        lambda message: (abort_event.set() or {"status": "SUCCESS"}),
++        "Test",
++    )
++    context = zmq.Context()
++    client = context.socket(zmq.REQ)
++    client.setsockopt(zmq.RCVTIMEO, 1500)
++    client.setsockopt(zmq.SNDTIMEO, 1500)
++    client.setsockopt(zmq.LINGER, 0)
++    try:
++        server.start()
++        client.connect(f"tcp://127.0.0.1:{port}")
++        client.send_json({"action": "ABORT"})
++        response = client.recv_json()
++        assert response["status"] == "SUCCESS"
++        assert abort_event.is_set()
++    finally:
++        client.close()
++        context.term()
++        server.close()
+\ No newline at end of file
+diff --git a/tests/test_camera_tcp.py b/tests/test_camera_tcp.py
+index 6c75d5f..57fa7a9 100644
+--- a/tests/test_camera_tcp.py
++++ b/tests/test_camera_tcp.py
+@@ -9,10 +9,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ if str(PROJECT_ROOT) not in sys.path:
+     sys.path.insert(0, str(PROJECT_ROOT))
+ 
+-from services.camera_tcp import run_camera_server
++from services.camera_tcp import CameraHardwareDriver, run_camera_server
+ 
+ @pytest.fixture(scope="module", autouse=True)
+-def camera_server_thread():
++def camera_server_thread(shutdown_service):
+     """Levanta el servidor Camera_TCP en puerto 5557."""
+     server_thread = threading.Thread(
+         target=run_camera_server, kwargs={"port": 5557, "mock_mode": True}, daemon=True
+@@ -20,6 +20,8 @@ def camera_server_thread():
+     server_thread.start()
+     time.sleep(0.5)
+     yield
++    shutdown_service(5557)
++    server_thread.join(timeout=3.0)
+ 
+ 
+ @pytest.fixture
+@@ -48,8 +50,71 @@ def test_set_config(zmq_camera_client):
+     assert res["gain"] == 150
+ 
+ 
+-def test_capture(zmq_camera_client):
+-    zmq_camera_client.send_json({"action": "CAPTURE", "filename": "test_frame.fits"})
++def test_capture(zmq_camera_client, tmp_path):
++    filename = str(tmp_path / "test_frame.fits")
++    zmq_camera_client.send_json({"action": "CAPTURE", "filename": filename})
+     res = zmq_camera_client.recv_json()
+     assert res["status"] == "SUCCESS"
+-    assert res["filename"] == "test_frame.fits"
+\ No newline at end of file
++    assert res["filename"] == filename
++
++
++def test_invalid_config_does_not_mutate_camera_state():
++    driver = CameraHardwareDriver(mock_mode=True)
++    before = (driver.exposure_ms, driver.gain, driver.binning, driver.roi_width, driver.roi_height)
++
++    with pytest.raises(ValueError):
++        driver.set_config(gain=-1)
++    with pytest.raises(ValueError):
++        driver.set_config(roi="unknown ROI")
++
++    after = (driver.exposure_ms, driver.gain, driver.binning, driver.roi_width, driver.roi_height)
++    assert after == before
++
++
++def test_mock_capture_can_be_aborted_without_writing_a_cube(tmp_path):
++    driver = CameraHardwareDriver(mock_mode=True)
++    filename = tmp_path / "aborted.fits"
++    result = {}
++    thread = threading.Thread(target=lambda: result.update(driver.capture(str(filename), frames=100)))
++    thread.start()
++
++    deadline = time.time() + 2.0
++    while driver.state != "EXPOSURING" and time.time() < deadline:
++        time.sleep(0.001)
++    driver.abort_requested.set()
++    thread.join(timeout=3.0)
++
++    assert not thread.is_alive()
++    assert result.get("status") == "ABORTED"
++    assert not filename.exists()
++
++
++def test_control_port_aborts_active_capture(tmp_path):
++    context = zmq.Context()
++    capture_socket = context.socket(zmq.REQ)
++    control_socket = context.socket(zmq.REQ)
++    for socket in (capture_socket, control_socket):
++        socket.setsockopt(zmq.RCVTIMEO, 3000)
++        socket.setsockopt(zmq.SNDTIMEO, 1000)
++        socket.setsockopt(zmq.LINGER, 0)
++    try:
++        capture_socket.connect("tcp://localhost:5557")
++        capture_socket.send_json({
++            "action": "CAPTURE",
++            "filename": str(tmp_path / "control-aborted.fits"),
++            "frames": 100,
++        })
++        time.sleep(0.03)
++
++        control_socket.connect("tcp://localhost:5563")
++        control_socket.send_json({"action": "ABORT"})
++        control_response = control_socket.recv_json()
++        capture_response = capture_socket.recv_json()
++
++        assert control_response["status"] == "SUCCESS"
++        assert capture_response["status"] == "ABORTED"
++        assert not (tmp_path / "control-aborted.fits").exists()
++    finally:
++        capture_socket.close()
++        control_socket.close()
++        context.term()
+\ No newline at end of file
+diff --git a/tests/test_focuser_tcp.py b/tests/test_focuser_tcp.py
+index 46e0301..4607f93 100644
+--- a/tests/test_focuser_tcp.py
++++ b/tests/test_focuser_tcp.py
+@@ -12,7 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
+ from services.focuser_tcp import run_focuser_server
+ 
+ @pytest.fixture(scope="module", autouse=True)
+-def focuser_server_thread():
++def focuser_server_thread(shutdown_service):
+     """Levanta el servidor Focuser_TCP en puerto 5556."""
+     server_thread = threading.Thread(
+         target=run_focuser_server, kwargs={"port": 5556, "mock_mode": True, "offset": 400}, daemon=True
+@@ -20,6 +20,8 @@ def focuser_server_thread():
+     server_thread.start()
+     time.sleep(0.5)
+     yield
++    shutdown_service(5556)
++    server_thread.join(timeout=3.0)
+ 
+ 
+ @pytest.fixture
+diff --git a/tests/test_mount_tcp.py b/tests/test_mount_tcp.py
+index f931886..8cb490b 100644
+--- a/tests/test_mount_tcp.py
++++ b/tests/test_mount_tcp.py
+@@ -13,7 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
+ from services.mount_tcp import run_mount_server
+ 
+ @pytest.fixture(scope="module", autouse=True)
+-def mount_server_thread():
++def mount_server_thread(shutdown_service):
+     """Levanta el servidor Mount_TCP en un hilo daemon antes de correr los tests."""
+     server_thread = threading.Thread(
+         target=run_mount_server, kwargs={"port": 5555, "mock_mode": True}, daemon=True
+@@ -22,6 +22,8 @@ def mount_server_thread():
+     # Breve pausa para asegurar que el socket ZMQ REP se vincule correctamente
+     time.sleep(0.5)
+     yield
++    shutdown_service(5555)
++    server_thread.join(timeout=3.0)
+ 
+ 
+ @pytest.fixture
+diff --git a/tests/test_pipeline_orchestrator.py b/tests/test_pipeline_orchestrator.py
+index 0c16ce0..7462364 100644
+--- a/tests/test_pipeline_orchestrator.py
++++ b/tests/test_pipeline_orchestrator.py
+@@ -13,9 +13,11 @@ from services.mount_tcp import run_mount_server
+ from services.focuser_tcp import run_focuser_server
+ from services.camera_tcp import run_camera_server
+ from services.pipeline_orchestrator import PipelineOrchestrator
++import services.pipeline_orchestrator as pipeline_orchestrator
++from services.abort_control import CAMERA_CONTROL_PORT, FOCUSER_CONTROL_PORT, MOUNT_CONTROL_PORT
+ 
+ @pytest.fixture(scope="module", autouse=True)
+-def launch_all_mock_services():
++def launch_all_mock_services(shutdown_service):
+     """Levanta los tres microservicios en puertos estándar para la prueba."""
+     threads = [
+         threading.Thread(target=run_mount_server, kwargs={"port": 5555, "mock_mode": True}, daemon=True),
+@@ -26,6 +28,10 @@ def launch_all_mock_services():
+         t.start()
+     time.sleep(0.6)
+     yield
++    for port in (5557, 5556, 5555):
++        shutdown_service(port)
++    for thread in threads:
++        thread.join(timeout=3.0)
+ 
+ 
+ def test_pre_flight_check():
+@@ -36,7 +42,63 @@ def test_pre_flight_check():
+     assert health["camera"] is True
+ 
+ 
+-def test_execute_ringss_sequence():
++def test_abort_signals_all_devices_without_resetting_running_state(monkeypatch):
++    orch = PipelineOrchestrator()
++    orch.state = "RUNNING"
++    calls = []
++
++    def record_control(port, action, timeout_ms=1000):
++        calls.append((port, action))
++        return {"status": "SUCCESS"}
++
++    monkeypatch.setattr(orch, "_send_control_request", record_control)
++    response = orch.abort_sequence()
++
++    assert response["status"] == "SUCCESS"
++    assert orch.abort_event.is_set()
++    assert orch.state == "ABORTING"
++    assert set(calls) == {
++        (MOUNT_CONTROL_PORT, "ABORT"),
++        (FOCUSER_CONTROL_PORT, "ABORT"),
++        (CAMERA_CONTROL_PORT, "ABORT"),
++    }
++
++
++def test_failed_preflight_prevents_hardware_commands(monkeypatch):
++    orch = PipelineOrchestrator()
++    monkeypatch.setattr(
++        orch,
++        "pre_flight_check",
++        lambda: {"mount": True, "focuser": False, "camera": True},
++    )
++    monkeypatch.setattr(
++        orch,
++        "_send_request",
++        lambda *args, **kwargs: pytest.fail("No device command should run after failed pre-flight"),
++    )
++
++    result = orch.execute_ringss_sequence()
++
++    assert result["status"] == "ERROR"
++    assert "no se iniciaron movimientos" in result["message"]
++
++
++def test_safety_rollback_moves_to_captured_initial_position(monkeypatch):
++    orch = PipelineOrchestrator()
++    requests = []
++
++    def record_request(port, action, payload=None, timeout_ms=5000):
++        requests.append((port, action, payload))
++        return {"status": "SUCCESS", "position": 12345}
++
++    monkeypatch.setattr(orch, "_send_request", record_request)
++    orch._safety_rollback(12345)
++
++    assert requests == [(5556, "MOVE_ABS", {"position": 12345})]
++
++
++def test_execute_ringss_sequence(tmp_path, monkeypatch):
++    monkeypatch.setattr(pipeline_orchestrator, "CAPTURES_DIR", tmp_path)
+     orch = PipelineOrchestrator(5555, 5556, 5557)
+     res = orch.execute_ringss_sequence(exp_ms=10.0, gain=80, frames_cube=100)
+     
+diff --git a/current/tests/test_science_adapter.py b/tests/test_science_adapter.py
+new file mode 100644
+index 0000000..08aad33
+--- /dev/null
++++ b/tests/test_science_adapter.py
+@@ -0,0 +1,45 @@
++import numpy as np
++from astropy.io import fits
++
++import services.science_adapter as science_adapter
++from services.science_adapter import RingssSciencePipeline
++
++
++def test_missing_fits_never_returns_synthetic_success(tmp_path):
++    result = RingssSciencePipeline(allow_mock_fallback=True).process_cube(
++        str(tmp_path / "missing.fits")
++    )
++
++    assert result["status"] == "ERROR"
++
++
++def test_invalid_fits_shape_never_returns_synthetic_success(tmp_path):
++    fits_path = tmp_path / "invalid-shape.fits"
++    fits.writeto(fits_path, np.zeros((64, 64), dtype=np.float32))
++
++    result = RingssSciencePipeline(allow_mock_fallback=True).process_cube(str(fits_path))
++
++    assert result["status"] == "ERROR"
++    assert "50 frames" in result["message"]
++
++
++def test_core_fallback_is_explicitly_mock_only(tmp_path, monkeypatch):
++    fits_path = tmp_path / "valid-shape.fits"
++    header = fits.Header()
++    header["EXPOSURE"] = 1000
++    header["GAIN"] = 100
++    header["DATE-OBS"] = "2026-11-09T00:00:00"
++    header["STAR"] = "5944"
++    fits.writeto(fits_path, np.zeros((50, 64, 64), dtype=np.float32), header)
++    monkeypatch.setattr(
++        science_adapter.cube2,
++        "Moments",
++        lambda cube: (_ for _ in ()).throw(RuntimeError("test core failure")),
++    )
++
++    real_result = RingssSciencePipeline().process_cube(str(fits_path))
++    mock_result = RingssSciencePipeline(allow_mock_fallback=True).process_cube(str(fits_path))
++
++    assert real_result["status"] == "ERROR"
++    assert mock_result["status"] == "SUCCESS"
++    assert mock_result["mode"] == "MOCK_FALLBACK"
+\ No newline at end of file
+diff --git a/tests/test_watchdog_manager.py b/tests/test_watchdog_manager.py
+index 88915a2..3f4771e 100644
+--- a/tests/test_watchdog_manager.py
++++ b/tests/test_watchdog_manager.py
+@@ -1,4 +1,6 @@
+ import sys
++import socket
++import threading
+ import time
+ from pathlib import Path
+ import pytest
+@@ -7,7 +9,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ if str(PROJECT_ROOT) not in sys.path:
+     sys.path.insert(0, str(PROJECT_ROOT))
+ 
+-from services.watchdog_manager import WatchdogManager
++from services.watchdog_manager import WatchdogManager, run_watchdog_server
+ 
+ @pytest.fixture
+ def watchdog_instance():
+@@ -38,14 +40,14 @@ def test_watchdog_cluster_lifecycle(watchdog_instance):
+     # 3. Validar estado general del clúster
+     status = watchdog_instance.get_cluster_status()
+     assert status["mock_mode"] is True
++    child_processes = list(watchdog_instance.processes.values())
+     for name in ["mount", "focuser", "camera", "orchestrator"]:
+         assert status["services"][name]["pid"] is not None
+ 
+     # 4. Detener clúster limpiamente
+     watchdog_instance.stop_all_services()
+-    time.sleep(0.5)
+-    for name in ["mount", "focuser", "camera", "orchestrator"]:
+-        assert watchdog_instance.processes[name].poll() is not None
++    assert all(process.poll() is not None for process in child_processes)
++    assert all(status == "STOPPED" for status in watchdog_instance.service_status.values())
+ 
+ 
+ def test_watchdog_conservative_hardware_policy():
+@@ -57,4 +59,20 @@ def test_watchdog_conservative_hardware_policy():
+     wd.audit_and_recover()
+     
+     assert wd.service_status["mount"] == "UNRESPONSIVE_PRESERVED"
+-    assert wd.consecutive_failures["mount"] == 3
+\ No newline at end of file
++    assert wd.consecutive_failures["mount"] == 3
++
++
++def test_watchdog_bind_failure_does_not_start_children(monkeypatch):
++    with socket.socket() as reservation:
++        reservation.bind(("127.0.0.1", 0))
++        port = reservation.getsockname()[1]
++        startup_event = threading.Event()
++        monkeypatch.setattr(
++            WatchdogManager,
++            "start_all_services",
++            lambda manager: pytest.fail("Children must not start when the watchdog port is occupied"),
++        )
++
++        run_watchdog_server(port=port, startup_event=startup_event)
++
++    assert startup_event.is_set()
+\ No newline at end of file
+diff --git a/tox.ini b/tox.ini
+index f389f8b..5820285 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -1,6 +1,6 @@
+ [tox]
+ envlist =
+-    py{37,38,39,310}-test{,-alldeps,-devdeps}{,-cov}
++    py{38,39,310}-test{,-alldeps,-devdeps}{,-cov}
+     build_docs
+     linkcheck
+     codestyle
